@@ -44,7 +44,11 @@ import {
 import { isoSecond } from "../time.ts";
 import { sourcePagePath } from "../paths.ts";
 import { assertVaultIdentityForWrite } from "../vault-identity.ts";
-import { intakeExtraction, type ExtractionIntake } from "../intake/extract-intake.ts";
+import {
+  intakeExtraction,
+  type ExtractionIntake,
+  type IntakeRelation,
+} from "../intake/extract-intake.ts";
 import { normalizeSourceIdentity } from "../intake/source-trust.ts";
 import { INTAKE_TRUST, untrustedSourceFrontmatter } from "../trust/untrusted-provenance.ts";
 import {
@@ -66,7 +70,11 @@ import {
   type PreExtractResult,
 } from "./pre-extract.ts";
 import { REVIEW_LANE } from "../write-gate.ts";
-import { resolveWriteDisposition, stageForReview } from "../pending/pending-lanes.ts";
+import {
+  listPendingLane,
+  resolveWriteDisposition,
+  stageForReview,
+} from "../pending/pending-lanes.ts";
 import type { WriteSubject } from "../write-disposition.ts";
 
 /** Frontmatter `kind:` marker of an ingested source summary page. */
@@ -176,6 +184,16 @@ export interface IngestSourceResult {
   readonly staged?: boolean;
   /** Id of the pending queue entry holding the staged summary page. */
   readonly pendingId?: string;
+  /**
+   * Present only on a staged ingest, and only when non-empty (review M13):
+   * extracted relations the intake deferred because applying one would have
+   * written `[[staged-id]]` into an already-published entity page - a link
+   * to an entity that exists only in the review queue, left behind for good
+   * if the operator rejects the staged page. They ride this result verbatim;
+   * the re-ingest a held-back manifest row guarantees applies them through
+   * the ordinary idempotent path once both endpoints are published.
+   */
+  readonly deferredRelations?: ReadonlyArray<IntakeRelation>;
 }
 
 /**
@@ -250,11 +268,19 @@ export function ingestSource(
   // It used to be classified here as well and handed down as an argument,
   // which meant the same source was read twice and the second answer could be
   // overridden by the caller - see `intake/extract-intake.ts`.
+  // The disposition verdict rides along (the intake's disposition contract):
+  // on a `stage` verdict the intake stages the entity pages it CREATES into
+  // review beside the summary page, so a staged ingest publishes nothing -
+  // not the summary, not an entity page, not the manifest row below. The
+  // verdict was resolved ONCE above and is only forwarded here, never
+  // re-consulted. `refuse` is not expressible at this boundary: a deny threw
+  // at the resolution itself, before any write.
   const intake = intakeExtraction(vault, input.extraction, {
     agent: opts.agent,
     now: opts.now,
     provenance,
     ...(opts.readable !== undefined ? { readable: opts.readable } : {}),
+    ...(disposition.verdict === "stage" ? { disposition: "stage" as const } : {}),
   });
   const trust = intake.trust;
   const captureScope = captureScopeForTrust(trust);
@@ -322,9 +348,18 @@ export function ingestSource(
   // learn a page it cannot read exists.
   let stagedFields: { readonly pendingId: string } | undefined;
   if (!withheld && !unchanged && !existed && disposition.verdict === "stage") {
+    // One open entry per publish target (review M13): a re-ingest of a
+    // source whose summary is still staged re-renders the same page and
+    // used to refuse with a staged-target conflict. The open entry IS the
+    // staged summary - it is reused, never duplicated.
+    const open = listPendingLane(vault, REVIEW_LANE.ingest).entries.find(
+      (entry) => entry.publishTarget === summaryPath,
+    );
     stagedFields = {
-      pendingId: stageForReview(vault, REVIEW_LANE.ingest, summaryPath, () => nextContents)
-        .pendingId,
+      pendingId:
+        open !== undefined
+          ? open.id
+          : stageForReview(vault, REVIEW_LANE.ingest, summaryPath, () => nextContents).pendingId,
     };
   }
   if (stagedFields === undefined && !withheld && !unchanged) {
@@ -345,8 +380,16 @@ export function ingestSource(
   // digest anywhere, the manifest included.
   // Nor when the page was withheld: the manifest would then record a
   // summary as current that this call did not write.
+  // Nor on a `stage` disposition: the manifest row is a registration row of
+  // the same logical write as the summary and entity pages, so it owes the
+  // verdict they got (the intake's disposition contract) - a staged ingest
+  // must not record itself as done while its output awaits review. The row
+  // stays unrecorded until a publish arm actually writes; a re-ingest then
+  // re-classifies the source as new and re-runs, which is the fail-safe
+  // direction.
   if (
     !withheld &&
+    disposition.verdict !== "stage" &&
     trust === INTAKE_TRUST.trusted &&
     resolvesInsideVault(vault, canonicalSource) &&
     existsSync(join(vault, canonicalSource))
@@ -377,6 +420,9 @@ export function ingestSource(
     connections,
     captureScope,
     ...(stagedFields !== undefined ? { staged: true, pendingId: stagedFields.pendingId } : {}),
+    ...(intake.deferredRelations !== undefined
+      ? { deferredRelations: intake.deferredRelations }
+      : {}),
     ...(preExtract !== undefined ? { preExtract } : {}),
     ...(derivation?.parts !== undefined ? { parts: derivation.parts } : {}),
     ...(derivation?.table !== undefined ? { table: derivation.table } : {}),

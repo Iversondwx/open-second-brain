@@ -32,7 +32,8 @@ import {
 import { SearchError } from "./types.ts";
 import type { ResolvedSearchConfig } from "./types.ts";
 import type { EventAnchor } from "./event-anchor.ts";
-import { readSchemaVersion } from "./schema.ts";
+import { readSchemaVersion, type DocumentAttribute } from "./schema.ts";
+import type { PropertyPushdown } from "./property-pushdown.ts";
 
 import * as aliases from "./store/aliases.ts";
 import * as chunkEntities from "./store/chunk-entities.ts";
@@ -343,6 +344,18 @@ export class Store {
   }
 
   /**
+   * The stored promoted-column verdicts of a candidate pool; see
+   * `documents.promotedColumnStates`. The post-rank promoted-key gate
+   * consumes this to arbitrate the rows the lanes' SQL admitted through a
+   * NULL column: judged live, never trusted from SQL.
+   */
+  promotedColumnStates(
+    documentIds: ReadonlyArray<number>,
+  ): Map<number, documents.PromotedColumnState> {
+    return documents.promotedColumnStates(this.db, documentIds);
+  }
+
+  /**
    * The materialised event anchor of one path (v11), or null when the
    * document is absent or declared no readable date. The query-side
    * event-time resolver consults this instead of re-scanning the note's
@@ -453,6 +466,16 @@ export class Store {
 
   hydrateChunks(chunkIds: ReadonlyArray<number>): Map<number, chunks.HydratedChunk> {
     return chunks.hydrateChunks(this.db, chunkIds);
+  }
+
+  /**
+   * Metadata-only pool hydration (recall-quality, C5): the pool's rows
+   * without `c.content` - content is hydrated for the ranked rows only,
+   * by {@link hydrateChunks}, inside the assembly. See
+   * `chunks.hydrateChunkRefs`.
+   */
+  hydrateChunkRefs(chunkIds: ReadonlyArray<number>): Map<number, chunks.HydratedChunk> {
+    return chunks.hydrateChunkRefs(this.db, chunkIds);
   }
 
   /**
@@ -569,7 +592,7 @@ export class Store {
 
   semanticTopK(
     queryVector: ReadonlyArray<number> | Float32Array,
-    opts: { readonly limit: number; readonly pathPrefix?: string | null },
+    opts: vectors.SemanticTopKOptions,
   ): vectors.SemanticHit[] {
     return vectors.semanticTopK(this.db, this.vecExtensionLoaded, queryVector, opts);
   }
@@ -655,6 +678,18 @@ export class Store {
   /** Normalised aliases of one document, sorted. */
   aliasesForDocument(documentId: number): ReadonlyArray<string> {
     return aliases.aliasesForDocument(this.db, documentId);
+  }
+
+  // ── document attributes (v14, recall-quality) ───────────────────────────────
+
+  /**
+   * Replace one document's stored frontmatter attributes wholesale. The
+   * caller derives the bounded, promoted-key-free rows with
+   * `documentAttributesFromFrontmatter` (schema.ts) from the same parsed
+   * frontmatter that fed the upsert's other columns.
+   */
+  replaceDocumentAttributes(documentId: number, attrs: ReadonlyArray<DocumentAttribute>): void {
+    documents.replaceDocumentAttributes(this.db, documentId, attrs);
   }
 
   /**
@@ -798,10 +833,7 @@ export class Store {
    * Top-K BM25 keyword hits. `fts5Query` is an already-escaped FTS5
    * MATCH expression; building it is fts.ts's job.
    */
-  keywordTopK(
-    fts5Query: string,
-    opts: { readonly limit: number; readonly pathPrefix?: string | null },
-  ): keyword.KeywordHit[] {
+  keywordTopK(fts5Query: string, opts: keyword.KeywordTopKOptions): keyword.KeywordHit[] {
     return keyword.keywordTopK(this.db, fts5Query, opts);
   }
 
@@ -814,7 +846,12 @@ export class Store {
    */
   trigramCandidates(
     trigramQuery: string,
-    opts: { readonly limit: number; readonly pathPrefix?: string | null },
+    opts: {
+      readonly limit: number;
+      readonly pathPrefix?: string | null;
+      readonly kind?: "page" | "section" | null;
+      readonly pushdown?: PropertyPushdown | null;
+    },
   ): trigram.TrigramCandidateOutcome {
     return trigram.trigramCandidates(this.db, trigramQuery, opts);
   }

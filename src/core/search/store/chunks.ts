@@ -8,6 +8,7 @@
 import { Database } from "bun:sqlite";
 
 import { SearchError } from "../types.ts";
+import { pathPrefixRange } from "./path-prefix.ts";
 import { nowIso, sqlPlaceholders } from "./sql.ts";
 import {
   matchCarriedVectors,
@@ -234,12 +235,34 @@ export function replaceDocumentChunks(
       db.run(`DELETE FROM chunks WHERE id IN (${sqlPlaceholders(removed)})`, removed);
     }
 
+    // The page-head rule (schema v14's backfill twin): chunk 0 carries the
+    // frontmatter block when it starts with the `---` fence, and the head is
+    // then the first content chunk - unless the document has no content
+    // chunk at all, in which case chunk 0 is all the page there is. A
+    // document without frontmatter starts its content at chunk 0.
+    const headIndex =
+      chunks[0] !== undefined && chunks[0].content.startsWith("---")
+        ? Math.min(1, chunks.length - 1)
+        : 0;
     const insert = db.prepare<
       { id: number },
-      [number, number, string, string, string, number, number, number, string, string, string]
+      [
+        number,
+        number,
+        string,
+        string,
+        string,
+        number,
+        number,
+        number,
+        string,
+        string,
+        string,
+        string,
+      ]
     >(
-      "INSERT INTO chunks(document_id, chunk_index, content, fts_content, content_hash, start_line, end_line, token_count, heading_path, created_at, updated_at) " +
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+      "INSERT INTO chunks(document_id, chunk_index, content, fts_content, content_hash, start_line, end_line, token_count, heading_path, created_at, updated_at, chunk_kind) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     );
     const now = nowIso();
     chunks.forEach((c, position) => {
@@ -260,6 +283,7 @@ export function replaceDocumentChunks(
         c.headingPath ?? "",
         now,
         now,
+        position === headIndex ? "page" : "section",
       );
       if (!row) throw new SearchError("INDEX_UNREADABLE", "chunk insert returned no id");
       ids.push(row.id);
@@ -340,9 +364,11 @@ const PENDING_ANTI_JOIN =
 
 /**
  * The anti-join's FROM/WHERE text and bindings for a scope. A scoped
- * census joins `documents` and matches each prefix with the
- * `substr(path, 1, length(?)) = ?` form the vector prefix filter uses,
- * which needs no LIKE wildcard escaping.
+ * census joins `documents` and matches each prefix with the sargable
+ * range form every other prefix reader uses (`path-prefix.ts`), which
+ * needs no LIKE wildcard escaping and lets `idx_documents_path` answer
+ * the match. A prefix whose last code point cannot increment has a null
+ * bound and contributes its lower-bound-only clause.
  */
 function pendingCensusClause(scope: PendingVectorScope | undefined): {
   sql: string;
@@ -350,13 +376,16 @@ function pendingCensusClause(scope: PendingVectorScope | undefined): {
 } {
   const prefixes = scope?.pathPrefixes ?? [];
   if (prefixes.length === 0) return { sql: PENDING_ANTI_JOIN, bindings: [] };
-  const matches = prefixes.map(() => "substr(d.path, 1, length(?)) = ?").join(" OR ");
+  const ranges = prefixes.map((prefix) => pathPrefixRange(prefix));
+  const matches = ranges
+    .map((range) => (range.hi !== null ? "(d.path >= ? AND d.path < ?)" : "(d.path >= ?)"))
+    .join(" OR ");
   return {
     sql:
       "FROM chunks c JOIN documents d ON d.id = c.document_id " +
       "LEFT JOIN embeddings e ON e.chunk_id = c.id " +
       `WHERE e.chunk_id IS NULL AND (${matches})`,
-    bindings: prefixes.flatMap((prefix) => [prefix, prefix]),
+    bindings: ranges.flatMap((range) => (range.hi !== null ? [range.lo, range.hi] : [range.lo])),
   };
 }
 
@@ -433,6 +462,69 @@ export function hydrateChunks(
       path: r.path,
       title: r.title,
       content: r.content,
+      startLine: r.start_line,
+      endLine: r.end_line,
+      mtime: r.mtime,
+      authoredAt: r.authored_at,
+      contentHash: r.content_hash,
+      documentHash: r.document_hash,
+    });
+  }
+  return out;
+}
+
+/**
+ * The METADATA-ONLY pool hydration (recall-quality, C5): the same
+ * projection as {@link hydrateChunks} minus `c.content` - the one column
+ * the candidate pool never consumes before ranking (scoring reads ids,
+ * paths, hashes, mtimes and authored instants), and by far the most
+ * expensive one to pull for every candidate.
+ *
+ * The rows type as {@link HydratedChunk} with `content: ""` so the
+ * downstream signatures do not fork; the assembly's content tier replaces
+ * the placeholder for the ranked rows before the first content consumer
+ * (MMR) reads it. A consumer reading `content` off the pool map directly
+ * would get the placeholder - which is why the pool map flows only to the
+ * scoring stages.
+ */
+export function hydrateChunkRefs(
+  db: Database,
+  chunkIds: ReadonlyArray<number>,
+): Map<number, HydratedChunk> {
+  const out = new Map<number, HydratedChunk>();
+  if (chunkIds.length === 0) return out;
+  const placeholders = sqlPlaceholders(chunkIds);
+  const rows = db
+    .query<
+      {
+        chunk_id: number;
+        document_id: number;
+        path: string;
+        title: string | null;
+        start_line: number;
+        end_line: number;
+        mtime: number;
+        authored_at: number | null;
+        content_hash: string;
+        document_hash: string;
+      },
+      number[]
+    >(
+      "SELECT c.id AS chunk_id, c.document_id, d.path AS path, d.title AS title, " +
+        "       c.start_line AS start_line, c.end_line AS end_line, d.mtime AS mtime, " +
+        "       d.authored_at AS authored_at, c.content_hash AS content_hash, " +
+        "       d.content_hash AS document_hash " +
+        "FROM chunks c JOIN documents d ON d.id = c.document_id " +
+        `WHERE c.id IN (${placeholders})`,
+    )
+    .all(...(chunkIds as number[]));
+  for (const r of rows) {
+    out.set(r.chunk_id, {
+      chunkId: r.chunk_id,
+      documentId: r.document_id,
+      path: r.path,
+      title: r.title,
+      content: "",
       startLine: r.start_line,
       endLine: r.end_line,
       mtime: r.mtime,

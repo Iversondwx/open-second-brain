@@ -8,14 +8,17 @@ import { Database } from "bun:sqlite";
 
 import { isEventAnchorSource, type EventAnchor } from "../event-anchor.ts";
 import {
+  DOCUMENT_ATTRIBUTES_TABLE,
   DOCUMENT_VISIBILITY_COLUMN,
   EVENT_TIME_MAX_COLUMN,
   EVENT_TIME_MIN_COLUMN,
   PINNED_COLUMN,
+  type DocumentAttribute,
   documentBasename,
   encodeDocumentVisibility,
 } from "../schema.ts";
 import { SearchError } from "../types.ts";
+import { pathPrefixRange } from "./path-prefix.ts";
 import { nowIso } from "./sql.ts";
 import { purgeVecRowsForDocument } from "./vectors.ts";
 
@@ -278,6 +281,38 @@ export function upsertDocument(db: Database, doc: DocumentInput): number {
 }
 
 /**
+ * Replace a document's stored frontmatter attributes (v14) wholesale: the
+ * previous set is deleted and the new one inserted in one transaction, so
+ * an interrupted write cannot leave a half-updated filter surface.
+ *
+ * The caller derives the rows with `documentAttributesFromFrontmatter`
+ * (schema.ts) from the SAME parsed frontmatter that feeds the degradation
+ * notices - the extractor
+ * owns the promoted-key skips and the bounds, so this function is a pure
+ * writer. The FK cascade removes the rows when the document goes.
+ */
+export function replaceDocumentAttributes(
+  db: Database,
+  documentId: number,
+  attrs: ReadonlyArray<DocumentAttribute>,
+): void {
+  db.exec("BEGIN");
+  try {
+    db.run(`DELETE FROM ${DOCUMENT_ATTRIBUTES_TABLE} WHERE document_id = ?`, [documentId]);
+    if (attrs.length > 0) {
+      const insert = db.prepare<undefined, [number, string, string]>(
+        `INSERT OR IGNORE INTO ${DOCUMENT_ATTRIBUTES_TABLE}(document_id, key, value) VALUES (?, ?, ?)`,
+      );
+      for (const attr of attrs) insert.run(documentId, attr.key, attr.value);
+    }
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+}
+
+/**
  * The documents among `documentIds` the index MEASURED as pinned
  * (`documents.pinned = 1`, v13; t_f7bef96a).
  *
@@ -298,6 +333,49 @@ export function pinnedDocumentIds(db: Database, documentIds: ReadonlyArray<numbe
     )
     .all(PINNED_YES, JSON.stringify([...new Set(documentIds)]));
   for (const r of rows) out.add(r.id);
+  return out;
+}
+
+/**
+ * The stored verdict of the promoted filter columns for one document: the
+ * `page_type` token (v6) and the measured `pinned` flag (v13). Either side
+ * is null when the column cannot speak for the row - `page_type` is written
+ * only for scalar-string `type` frontmatter, and `pinned` is NULL on every
+ * row an in-place upgrade carried over without re-examining.
+ */
+export interface PromotedColumnState {
+  readonly pageType: string | null;
+  readonly pinned: boolean | null;
+}
+
+/**
+ * The promoted-column verdicts of a candidate pool, keyed by document id.
+ *
+ * The post-rank promoted-key gate reads this to arbitrate exactly the rows
+ * the lanes' SQL admitted through a NULL arm (`column IS NULL`): the arm
+ * that admitted such a row proves nothing about the filter, so a NULL
+ * column is judged by the live filter and never trusted from SQL, while a
+ * non-NULL column keeps its as-indexed SQL verdict. One bounded query per
+ * filtered search - the pool is the post-rank window, not the corpus.
+ */
+export function promotedColumnStates(
+  db: Database,
+  documentIds: ReadonlyArray<number>,
+): Map<number, PromotedColumnState> {
+  const out = new Map<number, PromotedColumnState>();
+  if (documentIds.length === 0) return out;
+  const rows = db
+    .query<{ id: number; page_type: string | null; pinned: number | null }, [string]>(
+      `SELECT id, page_type, ${PINNED_COLUMN} AS pinned FROM documents ` +
+        `WHERE id IN (SELECT value FROM json_each(?))`,
+    )
+    .all(JSON.stringify([...new Set(documentIds)]));
+  for (const r of rows) {
+    out.set(r.id, {
+      pageType: r.page_type,
+      pinned: r.pinned === null ? null : r.pinned === PINNED_YES,
+    });
+  }
   return out;
 }
 
@@ -457,15 +535,26 @@ export function countDocuments(db: Database): number {
 }
 
 /**
- * How many documents sit under one raw path prefix, matched with the
- * same `substr` form the pending-vector census uses so the two agree.
+ * How many documents sit under one raw path prefix, matched with the same
+ * sargable range form the pending-vector census and the two query lanes
+ * use (`path-prefix.ts`), so every prefix reader agrees on one row set. A
+ * null bound (the prefix's last code point cannot increment) runs the
+ * census lower-bound-only.
  */
 export function countDocumentsUnderPrefix(db: Database, prefix: string): number {
+  const { lo, hi } = pathPrefixRange(prefix);
+  if (hi === null) {
+    return (
+      db
+        .query<{ c: number }, [string]>("SELECT count(*) AS c FROM documents WHERE path >= ?")
+        .get(lo)?.c ?? 0
+    );
+  }
   return (
     db
       .query<{ c: number }, [string, string]>(
-        "SELECT count(*) AS c FROM documents WHERE substr(path, 1, length(?)) = ?",
+        "SELECT count(*) AS c FROM documents WHERE path >= ? AND path < ?",
       )
-      .get(prefix, prefix)?.c ?? 0
+      .get(lo, hi)?.c ?? 0
   );
 }

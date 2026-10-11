@@ -75,6 +75,18 @@ const UNWRAPPED_NOTE =
 const UNWRAPPED_WARNING =
   "warning: the keyfile holds raw key material again and the passphrase no longer protects " +
   `it - re-run "o2b brain secret unlock" to wrap it when the raw key is no longer needed\n`;
+/**
+ * The custody nudge (PR #244 review L7): from the first unlock on, the
+ * passphrase is the only key to every stored value and a lost one is
+ * unrecoverable, and the one act that keeps a restorable copy -
+ * `export` - must run while the operator still holds the values. Printed
+ * on EVERY successful unlock, so an operator re-unlocking meets it again
+ * before the wrap becomes the thing they rely on.
+ */
+const UNLOCK_NUDGE =
+  "note: a lost passphrase is unrecoverable - the stored values stay unreadable forever " +
+  `without it. To keep a restorable backup, run "o2b brain secret export --out FILE" with a ` +
+  "passphrase you will not lose, before relying on the wrap.\n";
 
 /** The declared egress site of the bundle export (src/core/egress/registry.ts). */
 const BUNDLE_EGRESS_SITE = "brain-secret-bundle-export" as const;
@@ -300,6 +312,10 @@ export async function cmdBrainSecret(argv: string[]): Promise<number> {
         if (exposure !== null) {
           process.stderr.write(`warning: ${formatWrappedKeyfileExposure(exposure)}\n`);
         }
+        // The custody nudge rides every successful unlock, before the
+        // success note: the wrap has just begun or been re-entered, and
+        // this is the moment a restorable backup is still one command away.
+        process.stderr.write(UNLOCK_NUDGE);
         if (asJson) okJson({ unlocked: true });
         else ok(UNLOCKED_NOTE);
         return 0;
@@ -386,6 +402,25 @@ export async function cmdBrainSecret(argv: string[]): Promise<number> {
           agent,
           now,
         });
+        // The wildcard-allowlist warning (PR #244 review L2): an entry
+        // carried with the open exec allowlist `*` lets `secret run`
+        // execute ANY command. The bundle's AAD already proved the list
+        // is exactly what was exported - what it cannot say is whether
+        // exporting it was wise - so the import names every entry it
+        // restored whose allowlist is the open one. A non-wildcard
+        // bundle prints nothing and imports byte-identically.
+        const restored = new Set([...result.imported, ...result.replaced]);
+        const openAllowed = listSecrets(vault)
+          .filter((s) => restored.has(s.name) && s.allow.includes("*"))
+          .map((s) => s.name)
+          .toSorted();
+        if (openAllowed.length > 0) {
+          process.stderr.write(
+            `warning: secret import: ${openAllowed.map((n) => JSON.stringify(n)).join(", ")} ` +
+              'carries the open exec allowlist "*" - every command is allowed. Narrow it ' +
+              `("brain secret rm" + "brain secret set") if that is not intended.\n`,
+          );
+        }
         if (asJson) okJson({ imported: result.imported, replaced: result.replaced });
         else
           ok(

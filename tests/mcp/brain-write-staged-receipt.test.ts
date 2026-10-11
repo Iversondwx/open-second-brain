@@ -26,6 +26,8 @@ import { tmpdir } from "node:os";
 
 import { bootstrapBrain } from "../../src/core/brain/init.ts";
 import { atomicWriteFileSync } from "../../src/core/fs-atomic.ts";
+import { listPendingLane } from "../../src/core/brain/pending/pending-lanes.ts";
+import { REVIEW_LANE } from "../../src/core/brain/write-gate.ts";
 import { NOTES_TOOLS } from "../../src/mcp/brain/notes-tools.ts";
 import { WRITE_BATCH_TOOLS } from "../../src/mcp/brain/write-batch-tools.ts";
 import { INGEST_TOOLS } from "../../src/mcp/brain/ingest-tools.ts";
@@ -225,7 +227,7 @@ describe("a retried write over a still-pending stage answers the named code", ()
     expect(String(refused?.message)).toContain("already staged for review");
   });
 
-  test("brain_ingest_source carries pending-stage-conflict for a still-pending summary", async () => {
+  test("brain_ingest_source carries pending-stage-conflict for a still-pending stage", async () => {
     mkdirSync(join(vault, "Articles"), { recursive: true });
     writeFileSync(join(vault, "Articles/dup.md"), "source bytes\n", "utf8");
     const first = (await ingestSource(ctx, {
@@ -234,22 +236,20 @@ describe("a retried write over a still-pending stage answers the named code", ()
       entities: [{ category: "concept", name: "Rollups" }],
     })) as Record<string, unknown>;
     expect(first["staged"]).toBe(true);
-    const holdingId = first["pending_id"] as string;
-    let refused: MCPError | undefined;
-    try {
-      await ingestSource(ctx, {
-        source_path: "Articles/dup.md",
-        summary: "Second ingest summary.",
-        entities: [{ category: "concept", name: "Rollups" }],
-      });
-    } catch (err) {
-      refused = err instanceof MCPError ? err : undefined;
-    }
-    expect(refused).toBeInstanceOf(MCPError);
-    expect(refused?.code).toBe(INVALID_PARAMS);
-    const data = (refused?.data ?? {}) as Record<string, unknown>;
-    expect(data["code"]).toBe("pending-stage-conflict");
-    expect(data["existing_id"]).toBe(holdingId);
-    expect(data["target"]).toBe(first["summary_path"]);
+    // A staged ingest dedupes its pending entries by publish target, so a
+    // retry of the same source reuses the still-open entries instead of
+    // colliding: the second ingest succeeds idempotently and the pending
+    // lane holds no duplicates for it.
+    const laneBefore = listPendingLane(vault, REVIEW_LANE.notes).entries.length;
+    const second = (await ingestSource(ctx, {
+      source_path: "Articles/dup.md",
+      summary: "Second ingest summary.",
+      entities: [{ category: "concept", name: "Rollups" }],
+    })) as Record<string, unknown>;
+    expect(second["staged"]).toBe(true);
+    const laneAfter = listPendingLane(vault, REVIEW_LANE.notes).entries;
+    expect(laneAfter.length).toBe(laneBefore);
+    const targets = laneAfter.map((e) => e.publishTarget).toSorted();
+    expect(new Set(targets).size).toBe(targets.length);
   });
 });

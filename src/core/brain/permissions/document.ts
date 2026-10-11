@@ -34,6 +34,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { canonicalNotePath } from "../../path-safety.ts";
+
 /** The vault-relative directory the document lives in. */
 const DOCUMENT_DIRECTORY = "Brain";
 
@@ -45,6 +47,30 @@ export const PERMISSIONS_DOCUMENT_REL = `${DOCUMENT_DIRECTORY}/${DOCUMENT_BASENA
 
 /** The only schema version this build reads. Anything else hard-refuses. */
 export const PERMISSIONS_SCHEMA_VERSION = 1;
+
+/**
+ * The canonical form of a rule target: Windows separators and `.`-dot
+ * segments folded away, then the canonical note identity every stored
+ * path carries ({@link canonicalNotePath}: POSIX separators, NFC).
+ *
+ * The document is a hand-edited file synced across devices while the
+ * targets the gates consult are stored POSIX note paths, so a target
+ * spelled the way the writing host spells paths (`Notes\a.md`,
+ * `.\Notes\a.md`, `./Notes/a.md`) must reach the same rule the stored
+ * spelling does. Idempotent: an already-canonical target returns
+ * byte-identical. A `..` segment deliberately survives: the resolver
+ * matches canonical identities exactly, so such a target is inert by
+ * construction, and the loader warns rather than second-guessing the
+ * operator's spelling.
+ */
+export function canonicalPermissionTarget(target: string): string {
+  const folded = target
+    .replaceAll("\\", "/")
+    .split("/")
+    .filter((segment) => segment !== "" && segment !== ".")
+    .join("/");
+  return canonicalNotePath(folded);
+}
 
 /** What a rule says about one action. Deny wins every tie. */
 export type PermissionVerdict = "allow" | "ask" | "deny";
@@ -293,8 +319,24 @@ function isMapping(value: YamlValue | undefined): value is YamlMapping {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function warn(path: string, field: string): void {
-  process.stderr.write(`warning: ${path}: ${field}: unknown field ignored (forward-compat)\n`);
+/**
+ * Loader diagnostics write once per UNIQUE warning, not once per consult:
+ * the resolver runs on every gate check, and a permission write consults
+ * the document it just loaded, so the same warning repeated per write
+ * reads like a fresh defect - while a document with several distinct
+ * findings still reports each of them. A reset hook keeps it testable.
+ */
+const warned = new Set<string>();
+
+export function resetPermissionWarnings(): void {
+  warned.clear();
+}
+
+function warn(path: string, field: string, message: string): void {
+  const key = `${path}\u0000${field}\u0000${message}`;
+  if (warned.has(key)) return;
+  warned.add(key);
+  process.stderr.write(`warning: ${path}: ${field}: ${message}\n`);
 }
 
 function isVerdict(value: YamlValue): value is PermissionVerdict {
@@ -539,7 +581,34 @@ export function loadPermissionsDocument(vault: string): {
 
   // Warnings are emitted only once the document is known loadable, so a
   // refusing file never drowns its error in forward-compat noise.
-  for (const field of warnings) warn(path, field);
+  for (const field of warnings) {
+    warn(path, field, "unknown field ignored (forward-compat)");
+  }
+  for (const [index, entry] of entries.entries()) {
+    if (entry.target === undefined) continue;
+    const canonical = canonicalPermissionTarget(entry.target);
+    if (canonical !== entry.target) {
+      warn(
+        path,
+        `entries[${index}].target`,
+        `non-canonical target ${JSON.stringify(entry.target)}; it matches as ${JSON.stringify(canonical)}`,
+      );
+    }
+    // `..` survives canonicalization on purpose - the resolver matches
+    // canonical identities exactly, and a stored note path is
+    // vault-relative, so such a rule is silently inert. That silence is
+    // the hazard: an operator who wrote `../secrets/a.md` believes they
+    // closed a gate they never reached. Warn, and leave the exact-match
+    // semantics alone.
+    if (canonical.split("/").includes("..")) {
+      warn(
+        path,
+        `entries[${index}].target`,
+        `target ${JSON.stringify(entry.target)} still contains a '..' segment; ` +
+          "stored note paths are vault-relative, so this rule can never match",
+      );
+    }
+  }
 
   return {
     document: {

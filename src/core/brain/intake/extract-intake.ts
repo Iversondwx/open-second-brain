@@ -30,12 +30,57 @@
  * lane: the entities it introduces land quarantined and marked, and they are
  * records of what an untrusted source claimed rather than edits to what the
  * operator already holds.
+ *
+ * Disposition contract (write-side trust, Task 12): the CALLING lane resolves
+ * the review disposition ONCE for the logical write this intake belongs to and
+ * hands the verdict in through {@link IntakeOptions.disposition}. The arms:
+ *
+ *   - deny never reaches this primitive - the caller's gate refuses the whole
+ *     write (no entity page, no manifest row, no summary page) before the
+ *     intake runs, and this module performs no consult of its own, so two
+ *     consultations of one write can never disagree;
+ *   - `publish` (the default when the option is absent) is byte-identical to
+ *     the behavior before the contract existed;
+ *   - `stage` stages: every page the intake CREATES lands in the review queue
+ *     (`Brain/pending/notes/`, the one lane whose publish target can address
+ *     the entity tree) instead of staying in the canonical registry, carrying
+ *     the relations whose `from` side is itself a staged page, so the operator
+ *     reviews and the queue's apply publishes exactly the page a publish
+ *     intake would have written. A relation pointing INTO a staged page from
+ *     an already-published one is deferred onto the result
+ *     ({@link IntakeResult.deferredRelations}) - writing it before review
+ *     would leave a dangling link in a published page if the operator
+ *     rejected the staged page - and a re-ingest of a source still staged
+ *     dedupes onto the open queue entries instead of staging duplicates.
+ *     The UPDATE arm is untouched - already-admitted records are mutations,
+ *     and the review boundary is entry, not mutation.
+ *
+ * Label admission (review M4): a store-learned verdict refusing one label
+ * skips that entity and counts the skip on the result
+ * ({@link IntakeResult.entitiesSkipped}) instead of aborting the batch
+ * partway; structural and denylist refusals still fail the whole intake.
+ *
+ * The contract covers what this primitive writes. Every OTHER registration
+ * row of the same logical write - the ingest pipeline's manifest row above
+ * all - owes the same verdict at its own write site, so a staged ingest does
+ * not record itself as done while its output awaits review.
  */
 
+import { readFileSync, unlinkSync } from "node:fs";
+import { relative } from "node:path";
+
+import { canonicalNotePath } from "../../path-safety.ts";
 import { isKnownRelation, normalizeRelation } from "../../graph/relation-vocab.ts";
 import { TRANSPORT_REACH } from "../../graph/transport-reach.ts";
 import { isPathReadableAtReach, type FrontmatterCache } from "../../search/result-filters.ts";
-import { validateEntityCategory, normalizeEntityName } from "../entities/canonical.ts";
+import { entityPath } from "../paths.ts";
+import { listPendingLane, stageForReview } from "../pending/pending-lanes.ts";
+import { REVIEW_LANE } from "../write-gate.ts";
+import {
+  validateEntityCategory,
+  normalizeEntityName,
+  InvalidEntityLabelError,
+} from "../entities/canonical.ts";
 import { relateEntities, upsertEntity } from "../entities/registry.ts";
 import { renderProvenanceSection, type Provenance } from "../provenance/provenance.ts";
 import { INTAKE_TRUST, type IntakeTrust } from "../trust/untrusted-provenance.ts";
@@ -93,6 +138,27 @@ export interface IntakeOptions {
    * (untrusted lane, no digest), exactly like an absent file.
    */
   readonly readable?: (rel: string) => boolean;
+  /**
+   * The review disposition the CALLING lane already resolved for the logical
+   * write this intake belongs to (write-side trust, Task 12) - resolved once,
+   * by the caller that knows the subject and the target, never re-consulted
+   * here. Absent means `publish`, which is byte-identical to the behavior
+   * before this option existed. `deny` is not expressible: the caller's gate
+   * refused the whole write before the intake runs. On `stage` the pages this
+   * intake CREATES stage into review (`Brain/pending/notes/`) instead of
+   * staying published - see the module docblock for the full contract.
+   */
+  readonly disposition?: "publish" | "stage";
+}
+
+/** One created entity page this intake staged into review instead of publishing. */
+export interface StagedEntityPage {
+  /** Id of the created (and now staged) entity. */
+  readonly entityId: string;
+  /** Id of the pending queue entry holding the staged page. */
+  readonly pendingId: string;
+  /** Vault-relative canonical path the queue's apply publishes the page at. */
+  readonly publishTarget: string;
 }
 
 export interface IntakeResult {
@@ -103,11 +169,46 @@ export interface IntakeResult {
   /** Count of relations applied (idempotent; an already-linked edge is a no-op). */
   readonly relationsApplied: number;
   /**
+   * Count of entities this intake SKIPPED because the store-learned label
+   * admission gate refused the name at creation (`function-word-run`,
+   * `shouted-heading` - review M4). One refused label used to abort the
+   * whole batch partway: the entities before it created, the relations
+   * skipped, and every retry hitting the same label. The skip is counted
+   * so a caller can see it; a structural verdict or a denylist refusal is
+   * still a hard error that fails the intake.
+   */
+  readonly entitiesSkipped: number;
+  /** Count of relations NOT applied because an endpoint's label was skipped. */
+  readonly relationsSkipped: number;
+  /**
    * The lane this intake committed in. Returned so the MCP boundary reports
    * the verdict this primitive actually used instead of classifying the same
    * source a second time and reporting an answer that could disagree.
    */
   readonly trust: IntakeTrust;
+  /**
+   * Present only under a `stage` disposition ({@link IntakeOptions.disposition}):
+   * the created entity pages that went to the review queue instead of staying
+   * in the canonical registry, in creation order. Absent for a publish intake,
+   * which leaves every created page in place.
+   */
+  readonly stagedEntityPages?: ReadonlyArray<StagedEntityPage>;
+  /**
+   * Present only under a `stage` disposition, and only when non-empty
+   * (review M13): relations this intake did NOT apply because applying one
+   * would have written `[[staged-id]]` into an ALREADY PUBLISHED page - the
+   * `from` endpoint is not among this batch's created pages while the `to`
+   * endpoint exists only in the review queue, so the edge would dangle for
+   * as long as the staged page awaits review, and forever if the operator
+   * rejects it. The relations ride the disposition result verbatim, so the
+   * flow that follows the publish (a re-run of the same extraction, which
+   * the held-back manifest row of a staged ingest guarantees) applies them
+   * through the ordinary idempotent path once both endpoints are admitted.
+   * A relation whose `from` is itself a staged page still applies before
+   * staging - it rides the staged bytes and publishes with the page it
+   * lives on.
+   */
+  readonly deferredRelations?: ReadonlyArray<IntakeRelation>;
 }
 
 /** A typed extraction failed structural validation; nothing was written. */
@@ -117,6 +218,22 @@ export class IntakeValidationError extends Error {
     this.name = "IntakeValidationError";
   }
 }
+
+/**
+ * The label refusals an intake SKIPS rather than dies on (review M4): the
+ * two store-learned admission verdicts the registry's creation gate can
+ * raise. They are statistics over the corpus, so one learned-common word
+ * in an otherwise good batch must not wedge intake forever - the skip is
+ * counted on the result and the batch carries on. Every OTHER refusal -
+ * a structural verdict, the operator denylist - stays a hard error: those
+ * are admissions the operator actually made, not evidence the store
+ * learned, and a skipped denylist row would be a gate that only sometimes
+ * gates.
+ */
+const SKIPPED_LABEL_REASONS: ReadonlySet<string> = new Set([
+  "function-word-run",
+  "shouted-heading",
+]);
 
 /** Validate the whole payload before any write, so a bad intake never writes. */
 function validateIntake(intake: ExtractionIntake): void {
@@ -248,6 +365,18 @@ export function intakeExtraction(
 
   const entitiesCreated: string[] = [];
   const entitiesUpdated: string[] = [];
+  // Categories of the created records, beside their ids: the staging step
+  // below needs both to name a created page's canonical path.
+  const createdPages: { readonly id: string; readonly category: string }[] = [];
+  // Normalised names the admission gate refused: their relations cannot
+  // resolve an endpoint and are skipped by name instead of crashing.
+  const skippedNames = new Set<string>();
+  // Normalised name of every record this intake CREATED: under a `stage`
+  // disposition these are the batch's staged pages, and a relation pointing
+  // at one from outside the batch is deferred rather than applied (M13).
+  const createdByName = new Map<string, string>();
+  let entitiesSkipped = 0;
+  let relationsSkipped = 0;
 
   for (const entity of intake.entities) {
     const category = validateEntityCategory(entity.category);
@@ -258,23 +387,70 @@ export function intakeExtraction(
     const bodyOnCreate = provenanceSection
       ? `# ${entity.name.trim()}\n\n${provenanceSection}`
       : undefined;
-    const res = upsertEntity(vault, {
-      category,
-      name: entity.name,
-      ...(entity.aliases !== undefined ? { aliases: entity.aliases } : {}),
-      agent: opts.agent,
-      now: opts.now,
-      ...(entity.confidence !== undefined ? { confidence: entity.confidence } : {}),
-      ...(bodyOnCreate !== undefined ? { bodyOnCreate } : {}),
-      ...(untrustedOrigin ? { untrustedOrigin } : {}),
-      ...(origin.contentHash !== undefined ? { sourceContentHash: origin.contentHash } : {}),
-    });
-    if (res.created) entitiesCreated.push(res.entity.id);
-    else entitiesUpdated.push(res.entity.id);
+    let res;
+    try {
+      res = upsertEntity(vault, {
+        category,
+        name: entity.name,
+        ...(entity.aliases !== undefined ? { aliases: entity.aliases } : {}),
+        agent: opts.agent,
+        now: opts.now,
+        ...(entity.confidence !== undefined ? { confidence: entity.confidence } : {}),
+        ...(bodyOnCreate !== undefined ? { bodyOnCreate } : {}),
+        ...(untrustedOrigin ? { untrustedOrigin } : {}),
+        ...(origin.contentHash !== undefined ? { sourceContentHash: origin.contentHash } : {}),
+      });
+    } catch (exc) {
+      // Review M4: a store-learned admission verdict refuses one label, not
+      // the batch. Skip it, count it, and let the rest of the extraction
+      // commit - a retry then meets the same skip, idempotently, instead of
+      // failing on the same word forever. Any other refusal propagates.
+      if (exc instanceof InvalidEntityLabelError && SKIPPED_LABEL_REASONS.has(exc.reason)) {
+        skippedNames.add(normalizeEntityName(entity.name));
+        entitiesSkipped += 1;
+        continue;
+      }
+      throw exc;
+    }
+    if (res.created) {
+      entitiesCreated.push(res.entity.id);
+      createdPages.push({ id: res.entity.id, category: res.entity.category });
+      createdByName.set(normalizeEntityName(entity.name), res.entity.id);
+    } else {
+      entitiesUpdated.push(res.entity.id);
+    }
   }
 
   let relationsApplied = 0;
+  const deferredRelations: IntakeRelation[] = [];
   for (const rel of intake.relations ?? []) {
+    // An endpoint whose label was skipped does not resolve anywhere (the
+    // refusal fires only when no record answers to the name), so its edges
+    // are skipped and counted rather than crashed on.
+    if (
+      skippedNames.has(normalizeEntityName(rel.from)) ||
+      skippedNames.has(normalizeEntityName(rel.to))
+    ) {
+      relationsSkipped += 1;
+      continue;
+    }
+    // Disposition contract, stage arm (review M13): a relation whose `to`
+    // is one of this batch's staged pages but whose `from` is not would
+    // write `[[staged-id]]` into an already-published page - a link that
+    // dangles while the staged page awaits review and stays behind if the
+    // operator rejects it. The edge is deferred onto the result instead;
+    // the publish flow that follows applies it once both endpoints are
+    // admitted. A `from` inside the batch still applies: the edge rides
+    // the staged bytes and publishes with the page it lives on, exactly
+    // as it did before the deferral existed.
+    if (
+      opts.disposition === "stage" &&
+      createdByName.has(normalizeEntityName(rel.to)) &&
+      !createdByName.has(normalizeEntityName(rel.from))
+    ) {
+      deferredRelations.push(rel);
+      continue;
+    }
     relateEntities(vault, {
       from: {
         query: rel.from,
@@ -291,5 +467,54 @@ export function intakeExtraction(
     relationsApplied += 1;
   }
 
-  return { entitiesCreated, entitiesUpdated, relationsApplied, trust: origin.trust };
+  // Disposition contract, stage arm: AFTER the relations, so the staged bytes
+  // are the finished pages a publish intake would have left behind. Each
+  // created page is staged FIRST and only then removed from the canonical
+  // tree - a crash between the two leaves both copies (the queue's apply
+  // names the occupied target) and never a lost page.
+  // One open entry per publish target (review M13): a re-ingest of a source
+  // still awaiting review re-creates the same entity (the queue is invisible
+  // to the registry's index) and used to refuse with a staged-target
+  // conflict, leaving the re-created page orphaned in the canonical tree.
+  // An open entry holding the target IS the staged page - the canonical
+  // duplicate is dropped and the entry the operator already has is reported.
+  const openStagedTargets = new Map<string, string>();
+  if (opts.disposition === "stage" && createdPages.length > 0) {
+    for (const entry of listPendingLane(vault, REVIEW_LANE.notes).entries) {
+      if (entry.publishTarget !== undefined) openStagedTargets.set(entry.publishTarget, entry.id);
+    }
+  }
+  const stagedEntityPages =
+    opts.disposition === "stage" && createdPages.length > 0
+      ? createdPages.map((page) => {
+          const publishTarget = canonicalNotePath(
+            relative(vault, entityPath(vault, page.category, page.id)),
+          );
+          const existingId = openStagedTargets.get(publishTarget);
+          if (existingId !== undefined) {
+            unlinkSync(entityPath(vault, page.category, page.id));
+            return { entityId: page.id, pendingId: existingId, publishTarget };
+          }
+          const bytes = readFileSync(entityPath(vault, page.category, page.id), "utf8");
+          const { pendingId } = stageForReview(
+            vault,
+            REVIEW_LANE.notes,
+            publishTarget,
+            () => bytes,
+          );
+          unlinkSync(entityPath(vault, page.category, page.id));
+          return { entityId: page.id, pendingId, publishTarget };
+        })
+      : undefined;
+
+  return {
+    entitiesCreated,
+    entitiesUpdated,
+    relationsApplied,
+    entitiesSkipped,
+    relationsSkipped,
+    trust: origin.trust,
+    ...(stagedEntityPages !== undefined ? { stagedEntityPages } : {}),
+    ...(deferredRelations.length > 0 ? { deferredRelations } : {}),
+  };
 }

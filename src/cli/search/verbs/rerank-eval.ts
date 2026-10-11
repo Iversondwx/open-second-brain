@@ -13,8 +13,11 @@
  * Read-only for the vault's notes; with the decision-model kind it appends
  * one `decision_model_call` record per query, as any rerank would, tagged
  * `origin: "eval"`. Beside the gate's recommendation it reports hit@1/3/5/10
- * (up to k), per-query wins, losses and ties against off, and for the
- * decision-model kind the run's records by outcome, cost and latency, so
+ * (up to k), per-query wins, losses and ties against off, the deltas per
+ * language (t_693fa22a review, M14: each `by_lang` group of a reranked arm
+ * carries `delta_hit_at_k` / `delta_mrr`, so a reranker that helps one
+ * language and hurts another does not hide in the pooled numbers), and for
+ * the decision-model kind the run's records by outcome, cost and latency, so
  * an arm whose every call failed (and so equals off) is visible as such.
  */
 
@@ -26,10 +29,14 @@ import {
   buildDecisionModelReport,
   type DecisionModelUseSummary,
 } from "../../../core/decision-model/diagnostics.ts";
-import type { RecallBenchmarkReport } from "../../../core/search/benchmark.ts";
+import type {
+  RecallBenchmarkQueryResult,
+  RecallBenchmarkReport,
+} from "../../../core/search/benchmark.ts";
 import { parseRecallBenchmarkDataset } from "../../../core/search/benchmark.ts";
 import {
   runRerankEvalGate,
+  type RerankDelta,
   type RerankEvalGateResult,
 } from "../../../core/search/rerank-eval-gate.ts";
 import type { ResolvedRerankConfig } from "../../../core/search/types.ts";
@@ -57,15 +64,75 @@ function isKind(value: string): value is ResolvedRerankConfig["kind"] {
 const HIT_DEPTHS = [1, 3, 5, 10] as const;
 
 /** hit@n for each depth the run measured (n <= k). */
-function hitsAt(report: RecallBenchmarkReport): Record<string, number> {
+function hitsAtRows(
+  rows: ReadonlyArray<RecallBenchmarkQueryResult>,
+  k: number,
+): Record<string, number> {
   const out: Record<string, number> = {};
-  const total = Math.max(1, report.perQuery.length);
+  const total = Math.max(1, rows.length);
   for (const n of HIT_DEPTHS) {
-    if (n > report.k) continue;
-    out[`hit_at_${n}`] =
-      report.perQuery.filter((q) => q.rank !== null && q.rank <= n).length / total;
+    if (n > k) continue;
+    out[`hit_at_${n}`] = rows.filter((q) => q.rank !== null && q.rank <= n).length / total;
   }
   return out;
+}
+
+function hitsAt(report: RecallBenchmarkReport): Record<string, number> {
+  return hitsAtRows(report.perQuery, report.k);
+}
+
+/**
+ * The per-language split of one arm (t_693fa22a): the arm's `byLang`
+ * aggregates with the hit@n depths recomputed over the group's rows.
+ * When the caller passes the gate's per-language deltas (M14), each
+ * group also carries `delta_hit_at_k` / `delta_mrr` - that group's
+ * rerank-arm minus baseline difference - so a reranker that helps one
+ * language and hurts another is readable per language. Only a mixed
+ * dataset produces more than one key; a single-language run carries one
+ * group equal to the arm's own numbers.
+ */
+function byLangOf(
+  report: RecallBenchmarkReport,
+  deltas?: Readonly<Record<string, RerankDelta>>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [lang, agg] of Object.entries(report.byLang)) {
+    const rows = report.perQuery.filter((q) => q.lang === lang);
+    const delta = deltas?.[lang];
+    out[lang] = {
+      total: agg.total,
+      hit_at_k: agg.hitAtK,
+      mrr: agg.mrr,
+      ...hitsAtRows(rows, report.k),
+      ...(delta !== undefined ? { delta_hit_at_k: delta.hitAtK, delta_mrr: delta.mrr } : {}),
+    };
+  }
+  return out;
+}
+
+/** One line per language, sorted by tag, shown when a dataset is mixed. */
+function renderByLang(
+  report: RecallBenchmarkReport,
+  deltas?: Readonly<Record<string, RerankDelta>>,
+): string {
+  const langs = Object.keys(report.byLang);
+  if (langs.length <= 1) return "";
+  return (
+    "\n" +
+    langs
+      .map((lang) => {
+        const rows = report.perQuery.filter((q) => q.lang === lang);
+        const delta = deltas?.[lang];
+        return (
+          `    ${lang}: ${report.byLang[lang]!.total} query(ies)  ` +
+          `${renderHitsRows(rows, report.k)}  MRR ${fmt(report.byLang[lang]!.mrr)}` +
+          (delta !== undefined
+            ? `  (delta hit@k ${signed(delta.hitAtK)}, MRR ${signed(delta.mrr)})`
+            : "")
+        );
+      })
+      .join("\n")
+  );
 }
 
 /** Per-query comparison against off, by reciprocal rank. */
@@ -95,6 +162,7 @@ function arm(result: RerankEvalGateResult): Record<string, unknown> {
     delta_mrr: result.deltas.mrr,
     versus_off: versusOff(result.baseline, result.reranked),
     recommendation: result.recommendation,
+    by_lang: byLangOf(result.reranked, result.deltas.byLang),
   };
 }
 
@@ -110,7 +178,11 @@ function callsOf(summary: DecisionModelUseSummary | undefined): Record<string, u
 }
 
 function renderHits(report: RecallBenchmarkReport): string {
-  return Object.entries(hitsAt(report))
+  return renderHitsRows(report.perQuery, report.k);
+}
+
+function renderHitsRows(rows: ReadonlyArray<RecallBenchmarkQueryResult>, k: number): string {
+  return Object.entries(hitsAtRows(rows, k))
     .map(([key, value]) => `${key.replace("hit_at_", "hit@")} ${fmt(value)}`)
     .join("  ");
 }
@@ -193,6 +265,7 @@ export async function cmdSearchRerankEval(argv: ReadonlyArray<string>): Promise<
           hit_at_k: gate.baseline.hitAtK,
           mrr: gate.baseline.mrr,
           ...hitsAt(gate.baseline),
+          by_lang: byLangOf(gate.baseline),
         },
         [kindFlag]: { ...arm(gate), ...(calls !== null ? { calls } : {}) },
         ...(local !== null ? { local: arm(local) } : {}),
@@ -205,12 +278,14 @@ export async function cmdSearchRerankEval(argv: ReadonlyArray<string>): Promise<
     return (
       `  ${name.padEnd(15)} ${renderHits(r.reranked)}  MRR ${fmt(r.reranked.mrr)}` +
       `  (hit@k ${signed(r.deltas.hitAtK)}, MRR ${signed(r.deltas.mrr)}; ` +
-      `vs off ${vs.wins} win(s), ${vs.losses} loss(es), ${vs.ties} tie(s)) -> ${r.recommendation}\n`
+      `vs off ${vs.wins} win(s), ${vs.losses} loss(es), ${vs.ties} tie(s)) -> ${r.recommendation}` +
+      `${renderByLang(r.reranked, r.deltas.byLang)}\n`
     );
   };
   let text =
     `rerank eval over ${gate.baseline.total} query(ies), k=${gate.baseline.k}\n` +
-    `  ${"off:".padEnd(15)} ${renderHits(gate.baseline)}  MRR ${fmt(gate.baseline.mrr)}\n` +
+    `  ${"off:".padEnd(15)} ${renderHits(gate.baseline)}  MRR ${fmt(gate.baseline.mrr)}` +
+    `${renderByLang(gate.baseline)}\n` +
     line(kindFlag, gate);
   if (calls !== null) {
     const outcomes = Object.entries(calls["outcomes"] as Record<string, number>)
