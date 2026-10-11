@@ -26,9 +26,11 @@ import { assertVaultIdentityForWrite } from "../vault-identity.ts";
 import { decryptValue, encryptValue, loadOrCreateKey, type EncryptedValue } from "./crypto.ts";
 import {
   clearHeldKey,
+  heldUnlockedKey,
   isEnvelopeFile,
   SecretStoreKeyfileMissingError,
   unlockKeyfile as unlockKeyfileAtPath,
+  unwrapKeyfileToRaw,
   wrapKeyfile as wrapKeyfileAtPath,
 } from "./envelope.ts";
 import { restrictToOwner } from "./owner-acl.ts";
@@ -88,6 +90,17 @@ function storePath(vault: string): string {
 /** The keyfile path - exported for `./bundle.ts`'s wrap and import paths. */
 export function keyPath(vault: string): string {
   return join(secretsDir(vault), "keyfile");
+}
+
+/**
+ * The MCP token store path (write-side-trust, Task 3). Declared here so
+ * the custody targets below cover it with the same owner-only ACL sweep
+ * `setSecret` performs, and so `./token-store.ts` - which owns everything
+ * else about that file - shares one spelling of its location without
+ * this module importing back.
+ */
+export function tokenStorePath(vault: string): string {
+  return join(secretsDir(vault), "mcp-tokens.json");
 }
 
 /** The name rule `set` enforces, shared with the bundle importer. */
@@ -381,6 +394,49 @@ export function lockSecretKeyfile(vault: string, ctx: SecretAuditContext): void 
 }
 
 /**
+ * Whether a key-bearing operation over this vault would refuse as
+ * locked in THIS process: the keyfile is an envelope and the holder is
+ * empty. The CLI's key-bearing verbs consult it to decide whether the
+ * passphrase they are about to ingest is needed as the store unlock
+ * (and not, say, only the bundle passphrase).
+ */
+export function storeLockedForThisProcess(vault: string): boolean {
+  const kp = keyPath(vault);
+  return isEnvelopeFile(kp) && heldUnlockedKey(kp) === null;
+}
+
+/**
+ * Unwrap: replace the passphrase-wrapped keyfile with the raw 32-byte
+ * DEK it holds, the way back from a wrapped store. The passphrase is
+ * verified against the envelope BEFORE the swap, so a wrong passphrase
+ * leaves the wrap intact; a torn write is impossible (fsync'd atomic
+ * rename) and the raw bytes land at mode 0600.
+ *
+ * Refuses a store that was never wrapped - unwrapping there would mint
+ * nothing and say something false. This write puts key material back on
+ * disk in the clear; the verb that calls it says so on stderr, and the
+ * custody record below marks the state change.
+ */
+export function unwrapSecretKeyfile(
+  vault: string,
+  passphrase: string,
+  ctx: SecretAuditContext,
+): void {
+  assertVaultIdentityForWrite(vault);
+  const kp = keyPath(vault);
+  if (!isEnvelopeFile(kp)) {
+    throw new Error(
+      `secret unwrap: the keyfile is not passphrase-wrapped, nothing to unwrap: ${kp}`,
+    );
+  }
+  unwrapKeyfileToRaw(kp, passphrase);
+  // The holder is cleared with the wrap: this process reverts to plain
+  // raw-keyfile behavior, where the file itself is the key.
+  clearHeldKey(kp);
+  audit(vault, ctx, "secret_unwrapped", "keyfile", { keyfile_was_wrapped: true });
+}
+
+/**
  * The paths whose owner-only protection `set` requires before it stores
  * material: the directory and the keyfile, which `loadOrCreateKey` has
  * just ensured exist, and the ciphertext store ONLY when it already
@@ -397,6 +453,10 @@ export function custodyTargets(
     [keyPath(vault), "file"],
   ];
   if (existsSync(storePath(vault))) targets.push([storePath(vault), "file"]);
+  // Same rule as the ciphertext store: absent until the first mint, and
+  // a target from then on, so every later custody write re-applies the
+  // owner-only ACL to both files.
+  if (existsSync(tokenStorePath(vault))) targets.push([tokenStorePath(vault), "file"]);
   return targets;
 }
 

@@ -52,7 +52,7 @@ Brain verbs (observing memory):
   note-lifecycle   Note FILES: rename/move/archive/delete one, rewriting inbound links
   scaffold-stub    Unresolved wikilink targets: list them, or materialise a stub
   claims           Claim-graph query: current truth, truth-at-T, replaced-by, contested-by
-  decision         Capture/review decisions: record/outcome/show/list/similar
+  decision         Decisions: record/outcome/show/list/similar + open questions: open/list_open/show_open/resolve/discard
   tension          Detect + triage persisted contradictions: detect/list/show/confirm/dismiss/resolve
   digest           Render the recent-changes digest (markdown or --json)
   intent-review    Read-only pre-dream review of active signal clusters
@@ -72,6 +72,7 @@ Brain verbs (observing memory):
   set-primary      Declare or clear primary_agent in _brain.yaml (--clear)
   protect          Emit / apply native deny rules for Brain/ (--target {claudecode|codex} [--apply])
   unprotect        Remove OSB-managed deny rules for the chosen target (--target)
+  permissions      Show the trust policy document and query the decision ledger (show | ledger)
   merge            Merge two near-duplicate preferences (<keep> <drop>; --dry-run, --force)
   upgrade          Migrate release-owned files forward (--dry-run by default; --apply --yes)
   export           Dump preferences or a transcript dataset
@@ -149,7 +150,7 @@ Brain verbs (observing memory):
   agenda              Synthesize agenda conflicts/focus blocks from provided events
   today               Today dashboard: due obligations, open loops, recent activity, totals
   apply-markers       Apply @osb set frontmatter write-backs (report by default; --apply writes)
-  pending             Review the write-approval queue: list | apply <id> | reject <id>
+  pending             Review the write-approval queues (signals/notes/ingest): list | apply <id> | reject <id>
   signal              Fact signal lifecycle: retire <id> --reason <text>
   capture             Stage one capture from the terminal: body, source, sender, guidance
   telegram-capture    Inbound Telegram capture bot: run (long-poll) | catchup
@@ -205,12 +206,13 @@ Common flags:
  * swallowing it while the flag's effect never happens.
  */
 const SECRET_OP_FLAGS: Record<string, ReadonlyArray<string>> = {
-  set: ["env-var", "allow", "from-env", "agent"],
+  set: ["env-var", "allow", "from-env", "passphrase-from-env", "agent"],
   list: [],
-  rm: [],
-  run: ["agent"],
+  rm: ["passphrase-from-env"],
+  run: ["passphrase-from-env", "agent"],
   lock: [],
   unlock: ["passphrase-from-env"],
+  unwrap: ["passphrase-from-env"],
   export: ["out", "passphrase-from-env"],
   import: ["replace", "passphrase-from-env"],
 };
@@ -251,6 +253,7 @@ export const SECRET_VERB_USAGE =
     secretOpUsage("rm", "rm <name>"),
     secretOpUsage("lock", "lock"),
     secretOpUsage("unlock", "unlock"),
+    secretOpUsage("unwrap", "unwrap"),
     secretOpUsage("export", "export"),
     secretOpUsage("import", "import FILE"),
     secretOpUsage("run", "run <name>", " -- <command...>"),
@@ -357,7 +360,7 @@ export const VERB_HELP: Record<string, string> = {
     "--replaced <id> follows the supersede chain to the live tip; --contests <id>\n" +
     "lists contesting claims; --rebuild rebuilds and persists Brain/claim-graph.json.\n",
   decision:
-    "usage: o2b brain decision <record|outcome|rate|show|list|compare|similar|history|recall> [...] [--vault <path>] [--json]\n" +
+    "usage: o2b brain decision <record|outcome|rate|show|list|compare|similar|history|recall|open|list_open|show_open|resolve|discard> [...] [--vault <path>] [--json]\n" +
     "Decision-record note family under Brain/decisions/. record --title <t> --chosen <c>\n" +
     "--assumption <a> --review-date <YYYY-MM-DD> [--premortem <p>] [--notes <n>]\n" +
     "[--rating <1-5>] [--rationale <r>] captures a type: decision note and opens one review\n" +
@@ -371,7 +374,16 @@ export const VERB_HELP: Record<string, string> = {
     "[--turn <n>] [--count <n>] [--last-turn <n>] [--surfaced-ids <id> ...]\n" +
     "deterministically resurfaces a rated decision matching the prompt when\n" +
     "decision_recall.max_per_session is configured (byte-identical when unset); the\n" +
-    "count/last-turn/surfaced-ids flags thread the per-session cap and spacing state.\n",
+    "count/last-turn/surfaced-ids flags thread the per-session cap and spacing state.\n" +
+    "Open decisions (parked questions with enumerated options) live beside them as\n" +
+    "open-<slug>.md: open --title <t> --question <q> --option <o> [--option <o>...]\n" +
+    "[--context <c>] parks one (a duplicate question refuses, naming the existing id);\n" +
+    "a title with no ASCII letters or digits hashes to an unnamed-<hash> id (the slug\n" +
+    "grammar is ASCII); list_open [--status open|resolved|discarded] lists them\n" +
+    "(unreadable records named); show_open <id> reads one; resolve <id> --choice <c>\n" +
+    "[--rationale <r>] mints the real type: decision page and stamps the pointer;\n" +
+    "discard <id> --reason <r> closes the question without deciding. Terminal records\n" +
+    "stay in place.\n",
   tension:
     "usage: o2b brain tension <detect|list|show|confirm|dismiss|resolve|verify> [...] [--vault <path>] [--json]\n" +
     "Triage persisted contradictions under Brain/tensions/. detect [--jaccard <n>] scans\n" +
@@ -455,6 +467,10 @@ export const VERB_HELP: Record<string, string> = {
   unfreeze:
     "usage: o2b brain unfreeze [--vault <path>] [--json]\n" +
     "Remove the freeze marker and reopen the content lane. The unfreeze log event records who lifted it and what the marker said, which is the only place that survives the file. Idempotent.\n",
+  permissions:
+    "usage: o2b brain permissions show [--vault <path>] [--json]\n" +
+    "       o2b brain permissions ledger [--actor <name>] [--action <write|ingest|owner_write>] [--verdict <allow|ask|deny>] [--since <iso>] [--until <iso>] [--limit <n>] [--vault <path>] [--json]\n" +
+    "Show the vault's permissions document (Brain/_permissions.yaml) with a dry-run decision table resolving every agent it declares against every action, or query the decision ledger rows the gates append. With no document every write is ungated. A document that cannot be read fails closed: show names the field and the file, and `o2b brain doctor` reports the same fault as permissions-unreadable.\n",
   pin:
     "usage: o2b brain pin --id <pref-id> [--vault <path>] [--json]\n" +
     "Set pinned: true. Idempotent. Exempts the preference from automatic retire.\n",
@@ -684,11 +700,17 @@ export const VERB_HELP: Record<string, string> = {
     "context leakage and vault sync exposure - not against root.\n" +
     "unlock wraps the keyfile under a passphrase (read from stdin or\n" +
     "--passphrase-from-env, never argv) and holds the key for this process\n" +
-    "only; lock clears it, and every other process must unlock separately.\n" +
-    "export writes every entry as one passphrase-encrypted bundle to the\n" +
-    "--out file (values re-encrypted; names and env-var mappings travel in\n" +
-    "the clear past the shared egress redactor); import restores a bundle,\n" +
-    "refusing names the store already holds unless --replace is given.\n" +
+    "only; lock clears it. A wrapped store reaches every key-bearing verb:\n" +
+    "each accepts --passphrase-from-env (or stdin, where its own work does\n" +
+    "not occupy stdin) and unlocks before it runs, and a non-interactive\n" +
+    "host sets OPEN_SECOND_BRAIN_SECRETS_PASSPHRASE, which the first key\n" +
+    "operation consumes and deletes. unwrap writes the raw keyfile back,\n" +
+    "ending the passphrase protection. export writes every entry as one\n" +
+    "passphrase-encrypted bundle to the --out file (values re-encrypted and\n" +
+    "authenticated against their entry metadata; names and env-var mappings\n" +
+    "travel in the clear past the shared egress redactor); import restores a\n" +
+    "bundle, refusing names the store already holds unless --replace is\n" +
+    "given.\n" +
     "WARNING: a lost passphrase is unrecoverable - every stored value and\n" +
     "every exported bundle stays unreadable forever, and nothing recovers\n" +
     "them.\n",
@@ -1112,15 +1134,20 @@ export const VERB_HELP: Record<string, string> = {
     "and the run continues with the next marker. Source files\n" +
     "come from --path (repeatable) or notes.read_paths.\n",
   pending:
-    "usage: o2b brain pending list [--vault <path>] [--json]\n" +
-    "       o2b brain pending apply <id> [--vault <path>] [--json]\n" +
-    "       o2b brain pending reject <id> --reason <text> [--vault <path>] [--json]\n" +
-    "Review the opt-in write-approval queue (write_approval.enabled). When the\n" +
-    "toggle is on, extracted signals are staged into Brain/pending/ instead of\n" +
-    "Brain/inbox/. list shows the staged signals; apply moves one into\n" +
-    "Brain/inbox/ unchanged (entity anchors and dedup hash preserved); reject\n" +
-    "moves it to Brain/retired/ with retire-shaped frontmatter. Applying or\n" +
-    "rejecting a missing id exits 2 (never a silent no-op).\n",
+    "usage: o2b brain pending list [--lane signals|notes|ingest|all] [--vault <path>] [--json]\n" +
+    "       o2b brain pending apply <id> [--dry-run] [--vault <path>] [--json]\n" +
+    "       o2b brain pending reject <id> --reason <text> [--dry-run] [--vault <path>] [--json]\n" +
+    "Review the write-approval queues (write_approval.enabled plus the\n" +
+    "per-lane keys). Signals stage flat into Brain/pending/ (sig- ids), note\n" +
+    "creates under Brain/pending/notes/ (note- ids carrying the encoded\n" +
+    "publish target) and ingest summary pages under Brain/pending/ingest/\n" +
+    "(ing- ids). list shows every lane sorted (--lane filters one; files\n" +
+    "that cannot be read as queue entries are named with a reason, never\n" +
+    "silently skipped); apply moves one into its decoded publish target\n" +
+    "unchanged (--dry-run previews the move and writes nothing); reject\n" +
+    "renders it into Brain/retired/ with retire-shaped frontmatter (the\n" +
+    "same --dry-run honesty). Applying or rejecting a missing id exits 2\n" +
+    "(never a silent no-op).\n",
   signal:
     "usage: o2b brain signal retire <id> --reason <text> [--superseded-by <id>] [--vault <path>] [--json]\n" +
     "Retire an extracted fact signal: move Brain/inbox/sig-*.md into\n" +

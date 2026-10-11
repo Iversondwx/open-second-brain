@@ -5,6 +5,8 @@ import { join } from "node:path";
 
 import { JSONRPC_VERSION, MCPServer, PROTOCOL_VERSION } from "../../src/mcp/index.ts";
 import { buildToolTable } from "../../src/mcp/tools.ts";
+import { TRANSPORT_REACH } from "../../src/core/graph/transport-reach.ts";
+import { REMOTE_DENY_VISIBILITY_TOKEN } from "../../src/core/graph/visibility.ts";
 
 let vault: string;
 
@@ -44,6 +46,10 @@ async function call(
 function payload(response: { result?: unknown }): Record<string, unknown> {
   const result = response.result as { content: ReadonlyArray<{ type: string; text: string }> };
   return JSON.parse(result.content[0]!.text);
+}
+
+function errorMessage(response: { error?: unknown }): string {
+  return (response.error as { message?: string } | undefined)?.message ?? "";
 }
 
 describe("brain_decision tool", () => {
@@ -261,5 +267,179 @@ describe("brain_decision tool", () => {
       review_date: "not-a-date",
     });
     expect(res.error).toBeDefined();
+  });
+});
+
+describe("brain_decision open-decision actions", () => {
+  test("open parks a question, list_open and show_open read it, resolve mints the page", async () => {
+    const server = new MCPServer({ vault, configPath: null });
+    await initialize(server);
+    const opened = payload(
+      await call(server, {
+        action: "open",
+        title: "Which HTTP client for ingest",
+        question: "Which HTTP client should the ingest lane adopt?",
+        options: ["bun fetch", "undici"],
+        context: "Needs pooling.",
+      }),
+    );
+    expect(opened["id"]).toBe("open-which-http-client-for-ingest");
+    expect(opened["status"]).toBe("open");
+
+    const listed = payload(await call(server, { action: "list_open" }));
+    expect((listed["open_decisions"] as unknown[]).length).toBe(1);
+    expect(listed["unreadable"]).toEqual([]);
+
+    const shown = payload(await call(server, { action: "show_open", id: opened["id"] }));
+    expect(shown["question"]).toBe("Which HTTP client should the ingest lane adopt?");
+    expect(shown["options"]).toEqual(["bun fetch", "undici"]);
+
+    const resolved = payload(
+      await call(server, { action: "resolve", id: opened["id"], choice: "bun fetch" }),
+    );
+    expect(resolved["decision"]).toBe("decision-which-http-client-for-ingest");
+
+    // The minted page is a real decision page, readable via `show`.
+    const page = payload(
+      await call(server, { action: "show", slug: "which-http-client-for-ingest" }),
+    );
+    expect(page["chosen"]).toBe("bun fetch");
+
+    // The open record is terminal now: the open filter shows nothing,
+    // and resolving again refuses.
+    const after = payload(await call(server, { action: "list_open", status: "open" }));
+    expect(after["open_decisions"]).toEqual([]);
+    const again = await call(server, {
+      action: "resolve",
+      id: opened["id"],
+      choice: "undici",
+    });
+    expect(again.error).toBeDefined();
+  });
+
+  test("list_open partitions by status and names unreadable records", async () => {
+    const { readFileSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const server = new MCPServer({ vault, configPath: null });
+    await initialize(server);
+    const openRec = payload(
+      await call(server, {
+        action: "open",
+        title: "Keep the legacy importer",
+        question: "Do we keep the legacy importer?",
+        options: ["keep", "drop"],
+      }),
+    );
+    const discardRec = payload(
+      await call(server, {
+        action: "open",
+        title: "Retry budget for ingest",
+        question: "Which retry budget for ingest?",
+        options: ["3", "5"],
+      }),
+    );
+    payload(await call(server, { action: "discard", id: discardRec["id"], reason: "superseded" }));
+
+    const openList = payload(await call(server, { action: "list_open", status: "open" }));
+    expect((openList["open_decisions"] as Array<{ id: string }>).map((r) => r.id)).toEqual([
+      openRec["id"] as string,
+    ]);
+    const discarded = payload(await call(server, { action: "list_open", status: "discarded" }));
+    expect((discarded["open_decisions"] as Array<{ id: string }>).map((r) => r.id)).toEqual([
+      discardRec["id"] as string,
+    ]);
+
+    // A hand-edited status is confined to its record: named, not fatal,
+    // and it never hides the readable sibling.
+    const path = join(vault, "Brain", "decisions", `${openRec["id"] as string}.md`);
+    writeFileSync(path, readFileSync(path, "utf8").replace("status: open", "status: gone"), "utf8");
+    const broken = payload(await call(server, { action: "list_open" }));
+    expect((broken["open_decisions"] as Array<{ id: string }>).map((r) => r.id)).toEqual([
+      discardRec["id"] as string,
+    ]);
+    expect((broken["unreadable"] as unknown[]).length).toBe(1);
+  });
+
+  test("resolving a choice outside the enumerated options refuses", async () => {
+    const server = new MCPServer({ vault, configPath: null });
+    await initialize(server);
+    const opened = payload(
+      await call(server, {
+        action: "open",
+        title: "Pick a queue",
+        question: "Which queue backs the worker?",
+        options: ["postgres", "rabbit"],
+      }),
+    );
+    const res = await call(server, {
+      action: "resolve",
+      id: opened["id"],
+      choice: "kafka",
+    });
+    expect(res.error).toBeDefined();
+  });
+
+  test("resolve and discard answer a below-reach id exactly like an absent one", async () => {
+    const { readFileSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const local = new MCPServer({ vault, configPath: null }, { reach: TRANSPORT_REACH.local });
+    await initialize(local);
+    const opened = payload(
+      await call(local, {
+        action: "open",
+        title: "Reach-gated question",
+        question: "May a below-reach caller act on this record?",
+        options: ["yes", "no"],
+      }),
+    );
+    // Reserve the record against remote reads, the dead-ends-reach way.
+    const path = join(vault, "Brain", "decisions", `${opened["id"] as string}.md`);
+    const text = readFileSync(path, "utf8");
+    const close = text.indexOf("\n---\n", "---\n".length);
+    writeFileSync(
+      path,
+      `${text.slice(0, close)}\nvisibility: [${REMOTE_DENY_VISIBILITY_TOKEN}]${text.slice(close)}`,
+      "utf8",
+    );
+
+    // A server with no reach minted is a remote caller: both transitions
+    // answer with the absent id's error, never a reach distinction.
+    const remote = new MCPServer({ vault, configPath: null });
+    await initialize(remote);
+    const gatedResolve = await call(remote, {
+      action: "resolve",
+      id: opened["id"],
+      choice: "yes",
+    });
+    expect(gatedResolve.error).toBeDefined();
+    expect(errorMessage(gatedResolve)).toBe(
+      `brain_decision: no open decision: ${opened["id"] as string}`,
+    );
+    const gatedDiscard = await call(remote, { action: "discard", id: opened["id"], reason: "x" });
+    expect(errorMessage(gatedDiscard)).toBe(
+      `brain_decision: no open decision: ${opened["id"] as string}`,
+    );
+
+    // The record was not touched, and a local caller can still act on it.
+    const listed = payload(await call(local, { action: "list_open", status: "open" }));
+    expect((listed["open_decisions"] as unknown[]).length).toBe(1);
+    const resolved = payload(
+      await call(local, { action: "resolve", id: opened["id"], choice: "yes" }),
+    );
+    expect(resolved["decision"]).toBe("decision-reach-gated-question");
+  });
+
+  test("no new tool was added: the open actions ride the existing brain_decision tool", async () => {
+    const { buildToolTable } = await import("../../src/mcp/tools.ts");
+    const table = buildToolTable("full");
+    expect(table.find((t) => t.name === "brain_decision")).toBeDefined();
+    const action = (
+      table.find((t) => t.name === "brain_decision")!.inputSchema as {
+        properties: { action: { enum: string[] } };
+      }
+    ).properties.action.enum;
+    for (const wanted of ["open", "list_open", "show_open", "resolve", "discard"]) {
+      expect(action).toContain(wanted);
+    }
   });
 });

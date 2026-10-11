@@ -6,7 +6,15 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { readdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  readdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,12 +27,15 @@ import {
   readEnvelope,
   SecretEnvelopeError,
   SecretStoreLockedError,
+  SECRET_STORE_PASSPHRASE_ENV,
   unlockKeyfile,
+  unwrapKeyfileToRaw,
   verifyKeyfilePassphrase,
   wrapKeyfile,
 } from "../../../../src/core/brain/secrets/envelope.ts";
 import { loadOrCreateKey } from "../../../../src/core/brain/secrets/crypto.ts";
 import { secretsDir } from "../../../../src/core/brain/secrets/store.ts";
+import { encryptValue } from "../../../../src/core/brain/secrets/value-cipher.ts";
 import { fakeCredential } from "../../../helpers/fake-credentials.ts";
 
 const KEY_BYTES = 32;
@@ -206,5 +217,139 @@ describe("the keyfile envelope", () => {
     // The second load returns the same bytes; the file stays 32 raw bytes.
     expect(loadOrCreateKey(keyPath).equals(dek)).toBe(true);
     expect(readFileSync(keyPath).length).toBe(KEY_BYTES);
+  });
+
+  test("a produced envelope that does not unwrap refuses BEFORE the keyfile is touched", () => {
+    // The wrap replaces the only copy of the DEK, so a seal that does not
+    // round-trip must refuse while the raw keyfile is still on disk - not
+    // discover the breakage after the rename has destroyed it.
+    const dek = loadOrCreateKey(keyPath);
+    const before = readFileSync(keyPath);
+    const brokenTag = Buffer.from("0123456789abcdef0123456789abcdef").toString("base64");
+    expect(() =>
+      wrapKeyfile(keyPath, PASSPHRASE, dek, {
+        seal: (key, plaintext) => ({ ...encryptValue(key, plaintext), tag: brokenTag }),
+      }),
+    ).toThrow(SecretEnvelopeError);
+    // The raw keyfile is exactly as it was.
+    expect(readFileSync(keyPath).equals(before)).toBe(true);
+    expect(isEnvelopeFile(keyPath)).toBe(false);
+    expect(loadOrCreateKey(keyPath).equals(dek)).toBe(true);
+  });
+
+  test("a write that lands bytes which are not the envelope restores the raw key and refuses", () => {
+    const dek = loadOrCreateKey(keyPath);
+    expect(() =>
+      wrapKeyfile(keyPath, PASSPHRASE, dek, {
+        write: (target) => writeFileSync(target, '{"version": 1, "kdf": {"n": 1'),
+      }),
+    ).toThrow(SecretEnvelopeError);
+    // The read-back check caught the mangled envelope and the raw key
+    // bytes were written back before the refusal.
+    expect(readFileSync(keyPath).equals(dek)).toBe(true);
+    expect(isEnvelopeFile(keyPath)).toBe(false);
+    expect(loadOrCreateKey(keyPath).equals(dek)).toBe(true);
+    // Windows reports every mode as 666 and enforces none: the owner-only
+    // mode is a POSIX property of the restore, pinned only where the
+    // platform honours file modes.
+    if (process.platform !== "win32") {
+      expect((statSync(keyPath).mode & 0o777).toString(8)).toBe("600");
+    }
+  });
+
+  test("a restore that itself fails reports the ORIGINAL read-back refusal, not the restore's", () => {
+    const dek = loadOrCreateKey(keyPath);
+    // The write lands bytes that are not the envelope (the read-back will
+    // refuse), and the restore's own temp path is occupied by a directory,
+    // so the restore cannot write the raw bytes back either. The thrown
+    // refusal must still be the read-back one - the fault that actually
+    // happened first - with the restore's own failure demoted to stderr.
+    mkdirSync(`${keyPath}.raw-tmp`);
+    const warnings: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+      warnings.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    let refused: unknown;
+    try {
+      wrapKeyfile(keyPath, PASSPHRASE, dek, {
+        write: (target) => writeFileSync(target, '{"version": 1, "kdf": {"n": 1'),
+      });
+    } catch (err) {
+      refused = err;
+    } finally {
+      process.stderr.write = original;
+    }
+    expect(refused).toBeInstanceOf(SecretEnvelopeError);
+    expect((refused as Error).message).not.toContain("raw-tmp");
+    // The restore failed, so the mangled envelope is what sits at the path.
+    expect(readFileSync(keyPath).equals(dek)).toBe(false);
+    expect(warnings.join("")).toContain("could not restore the raw keyfile");
+  });
+
+  test("a wrapped store unlocks from the environment once and the variable is consumed", () => {
+    const dek = loadOrCreateKey(keyPath);
+    wrapKeyfile(keyPath, PASSPHRASE, dek);
+    clearHeldKey(keyPath);
+    process.env[SECRET_STORE_PASSPHRASE_ENV] = PASSPHRASE;
+    try {
+      // The first key operation unlocks - the non-interactive host's
+      // startup story, since no prompt is answerable there.
+      expect(loadOrCreateKey(keyPath).equals(dek)).toBe(true);
+      expect(heldUnlockedKey(keyPath)).not.toBeNull();
+      // The value is gone from the environment: consumed, never passed on.
+      expect(process.env[SECRET_STORE_PASSPHRASE_ENV]).toBeUndefined();
+      // Later key operations serve from the holder.
+      expect(loadOrCreateKey(keyPath).equals(dek)).toBe(true);
+    } finally {
+      delete process.env[SECRET_STORE_PASSPHRASE_ENV];
+      clearHeldKey(keyPath);
+    }
+  });
+
+  test("an environment passphrase that does not unwrap is the named refusal and is still consumed", () => {
+    const dek = loadOrCreateKey(keyPath);
+    wrapKeyfile(keyPath, PASSPHRASE, dek);
+    clearHeldKey(keyPath);
+    process.env[SECRET_STORE_PASSPHRASE_ENV] = WRONG_PASSPHRASE;
+    try {
+      // ONE failed attempt: the offer is consumed whether or not it
+      // unwraps, so the second attempt sees the locked refusal instead of
+      // paying scrypt for the same wrong value again.
+      let refusal: unknown;
+      try {
+        loadOrCreateKey(keyPath);
+        throw new Error("expected the passphrase refusal");
+      } catch (err) {
+        refusal = err;
+      }
+      expect(refusal).toBeInstanceOf(SecretEnvelopeError);
+      expect((refusal as SecretEnvelopeError).code).toBe(ENVELOPE_REFUSAL_CODES.passphrase);
+      expect((refusal as Error).message).toContain(SECRET_STORE_PASSPHRASE_ENV);
+      expect(process.env[SECRET_STORE_PASSPHRASE_ENV]).toBeUndefined();
+      expect(heldUnlockedKey(keyPath)).toBeNull();
+      // With the offer consumed, the next attempt is the locked refusal.
+      expect(() => loadOrCreateKey(keyPath)).toThrow(SecretStoreLockedError);
+    } finally {
+      delete process.env[SECRET_STORE_PASSPHRASE_ENV];
+      clearHeldKey(keyPath);
+    }
+  });
+
+  test("unwrapKeyfileToRaw verifies the passphrase, then writes the raw DEK back at 0600", () => {
+    const dek = loadOrCreateKey(keyPath);
+    wrapKeyfile(keyPath, PASSPHRASE, dek);
+    clearHeldKey(keyPath);
+    // A wrong passphrase leaves the wrap intact.
+    expect(() => unwrapKeyfileToRaw(keyPath, WRONG_PASSPHRASE)).toThrow(SecretEnvelopeError);
+    expect(isEnvelopeFile(keyPath)).toBe(true);
+    const restored = unwrapKeyfileToRaw(keyPath, PASSPHRASE);
+    expect(restored.equals(dek)).toBe(true);
+    expect(isEnvelopeFile(keyPath)).toBe(false);
+    expect(readFileSync(keyPath).equals(dek)).toBe(true);
+    if (process.platform !== "win32") {
+      expect((statSync(keyPath).mode & 0o777).toString(8)).toBe("600");
+    }
   });
 });

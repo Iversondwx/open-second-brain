@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { JSONRPC_VERSION, MCPServer, PROTOCOL_VERSION } from "../../src/mcp/index.ts";
 import { buildToolTable } from "../../src/mcp/tools.ts";
+import { appendSessionSummary } from "../../src/core/brain/session-summary.ts";
 
 let vault: string;
 
@@ -94,11 +95,49 @@ describe("brain_session_summary tool", () => {
     expect(result.content[0]!.text).toBe(JSON.stringify({ found: false }, null, 2));
   });
 
-  test("get after two differing writes carries the additive divergence keys", async () => {
-    await call({ operation: "write", session_id: "dv", decisions: ["first take"] });
-    await call({ operation: "write", session_id: "dv", decisions: ["second take"] });
+  test("get after sequential revisions stays quiet (revisions, not divergence)", async () => {
+    // Two differing writes at distinct instants are a revision stream - the
+    // later digest wins deterministically - not a conflict (v1.78.0 review
+    // round). The instants are seeded explicitly because the tool's write
+    // path stamps its own clock, and two rapid writes can land inside one
+    // millisecond, which is the divergent shape the next test pins.
+    appendSessionSummary(vault, {
+      sessionId: "dv",
+      decisions: ["first take"],
+      createdAt: "2026-06-14T09:00:00.000Z",
+    });
+    appendSessionSummary(vault, {
+      sessionId: "dv",
+      decisions: ["second take"],
+      createdAt: "2026-06-14T11:00:00.000Z",
+    });
 
     const got = payload(await call({ operation: "get", session_id: "dv" }));
+    expect(got["found"]).toBe(true);
+    expect(got["digest_count"]).toBe(2);
+    expect("divergent" in got).toBe(false);
+    expect("records" in got).toBe(false);
+    const digest = got["digest"] as Record<string, unknown>;
+    expect(digest["decisions"]).toEqual(["second take"]);
+  });
+
+  test("get for distinct contents meeting at one instant carries the divergence keys", async () => {
+    // The tool's write path stamps its own (necessarily distinct) instants,
+    // so the divergent shape - distinct contents at one created_at instant,
+    // the one shape the store cannot order - is seeded with an explicit
+    // shared timestamp.
+    appendSessionSummary(vault, {
+      sessionId: "dv2",
+      decisions: ["device a take"],
+      createdAt: "2026-06-14T10:00:00.000Z",
+    });
+    appendSessionSummary(vault, {
+      sessionId: "dv2",
+      decisions: ["device b take"],
+      createdAt: "2026-06-14T10:00:00.000Z",
+    });
+
+    const got = payload(await call({ operation: "get", session_id: "dv2" }));
     expect(got["found"]).toBe(true);
     expect(got["digest_count"]).toBe(2);
     expect(got["divergent"]).toBe(true);
@@ -110,9 +149,9 @@ describe("brain_session_summary tool", () => {
       expect(typeof record["content_hash"]).toBe("string");
     }
     // id/hash lists, never full payload echoes.
-    expect(JSON.stringify(records)).not.toContain("first take");
+    expect(JSON.stringify(records)).not.toContain("device b take");
     const digest = got["digest"] as Record<string, unknown>;
-    expect(digest["decisions"]).toEqual(["second take"]);
+    expect(digest["decisions"]).toEqual(["device b take"]);
   });
 
   test("a single-record get adds digest_count and no divergence keys", async () => {

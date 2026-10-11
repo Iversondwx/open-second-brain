@@ -26,6 +26,7 @@
 
 import { join, relative } from "node:path";
 
+import type { WriteSubject } from "./write-disposition.ts";
 import type { FrontmatterMap } from "../types.ts";
 import { sanitiseTextField } from "../redactor.ts";
 import {
@@ -45,8 +46,10 @@ import {
 import { EXPIRATION_DATE_FIELD, normalizeExpirationDate } from "./expiration.ts";
 import { writeFrontmatterAtomic, parseFrontmatter, slugify } from "../vault.ts";
 import { requireObsidianTagValue } from "./tag-syntax.ts";
+import { REVIEW_LANE } from "./write-gate.ts";
+import { resolveWriteDisposition } from "./write-disposition.ts";
 import { compress, expand, CODEC_VERSION } from "./portability/codec.ts";
-import { allocateAndCreate, brainDirsForWrite, validateIsoDate } from "./paths.ts";
+import { allocateAndCreate, brainDirsForWrite, validateIsoDate, BRAIN_INBOX_REL } from "./paths.ts";
 import {
   isKnownSchemaToken,
   validateSchemaToken,
@@ -212,6 +215,16 @@ export interface WriteSignalOptions {
    * responsible for passing a directory that resolves inside the vault.
    */
   readonly targetDir?: string;
+  /**
+   * The credential-minted subject of the caller (write-side-trust, Task
+   * 7), when the transport resolved one. It is the subject the review
+   * disposition consults the permissions document under, so a document
+   * rule that denies the token's agent refuses this write; absent
+   * (stdio, the CLI) the resolver falls back to the config identity.
+   * Never consulted when `targetDir` is set: that caller IS the staging
+   * path, and must not re-enter the gate it feeds.
+   */
+  readonly subject?: WriteSubject;
 }
 
 /**
@@ -238,6 +251,15 @@ export function resolveEffectiveScope(
 export interface WriteSignalResult {
   readonly path: string;
   readonly id: string;
+  /**
+   * True when the write-approval review gate resolved ON for the signals
+   * lane and the signal was staged into `Brain/pending/` instead of
+   * `Brain/inbox/` (write-side trust, Task 6). The document is
+   * byte-for-byte identical either way - staging is purely a change of
+   * directory - and apply moves it verbatim. False on every direct
+   * write, and false on a deduped no-op (a dedup staged nothing).
+   */
+  readonly staged: boolean;
   /**
    * Set to `true` when an `idempotency_key` matched a prior write with an
    * identical payload, so this call was a deduped no-op (no new file). The
@@ -345,6 +367,7 @@ export function writeSignal(
         return {
           path: ref.path ? join(vault, ref.path) : "",
           id: ref.id ?? "",
+          staged: false,
           deduped: true,
         };
       }
@@ -356,7 +379,37 @@ export function writeSignal(
   // materializes a mis-resolved root, so it asserts the vault identity
   // before allocating a filename under it.
   const dirs = brainDirsForWrite(vault);
+  // Review disposition (write-side trust, Tasks 6, 9 and 12). Resolved
+  // ONLY when the caller named no targetDir: an explicit target is the
+  // staging path itself (`stagePendingSignal`), and it must never
+  // re-enter the gate it feeds. With no permissions document the signals
+  // lane's toggle decides, exactly as before; with one, the document is
+  // the ONLY gate - a deny throws WriteRefusedError here (before any
+  // byte exists, one ledger row behind it), an ask stages into
+  // `Brain/pending/` with byte-identical bytes, and an allow publishes.
+  // The target is the first candidate's inbox path: exact enough for the
+  // document's target entries, and the write intent the caller asked
+  // for even where the allocator's collision suffix moves it. The
+  // subject is the transport-minted one when a caller threaded it; the
+  // fallback is the write's own agent field, which every surface that
+  // gets here has already resolved against its config (a token caller's
+  // foreign claim was refused before this write was attempted) - letting
+  // the resolver re-resolve instead would answer for an identity no
+  // config on this machine declared. Every ungated caller (MCP and CLI
+  // feedback, inline scan, session import, session lifecycle, session
+  // checkpoint) inherits the gate here at the chokepoint with no change
+  // of its own.
   const prefix = signalPrefix(sanitised.date);
+  let gateStaged = false;
+  if (options.targetDir === undefined) {
+    const disposition = resolveWriteDisposition(
+      vault,
+      REVIEW_LANE.signals,
+      options.subject ?? { agent: resolvedInput.agent, via: "config" },
+      { target: `${BRAIN_INBOX_REL}/${prefix}-${sanitised.slug}.md` },
+    );
+    gateStaged = disposition.verdict === "stage";
+  }
 
   // Allocation and creation are one step (#161): a signal write is the
   // most contended name in the vault - inline scan, pending drain and
@@ -367,7 +420,7 @@ export function writeSignal(
     allocateAndCreate(
       {
         vault,
-        targetDir: options.targetDir ?? dirs.inbox,
+        targetDir: options.targetDir ?? (gateStaged ? dirs.pending : dirs.inbox),
         prefix,
         slug: sanitised.slug,
         maxAttempts: options.maxSlugAttempts,
@@ -406,7 +459,7 @@ export function writeSignal(
     );
   }
 
-  return { path: allocated.path, id };
+  return { path: allocated.path, id, staged: gateStaged };
 }
 
 /**
