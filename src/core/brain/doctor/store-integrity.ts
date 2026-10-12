@@ -11,6 +11,7 @@
 import { dirname, join } from "node:path";
 
 import { ensureInsideVault, realpathInsideVault, vaultRelative } from "../../path-safety.ts";
+import { resolveAgentName } from "../../config.ts";
 import { readFreshenState } from "../../search/freshen.ts";
 import { BRAIN_LOG_AUDIT_DIRS } from "../audit-dirs.ts";
 import { continuityLogDir } from "../continuity/store.ts";
@@ -22,7 +23,14 @@ import { JSONL_LEDGER_EXT, listSyncConflictFiles } from "../ledger-shards.ts";
 import { brainStateDirPath } from "../lineage/ledger.ts";
 import { metricsDir } from "../metrics.ts";
 import { BRAIN_SKILL_PROPOSALS_REL } from "../path-constants.ts";
+import {
+  loadPermissionsDocument,
+  PERMISSIONS_DOCUMENT_REL,
+  PermissionsDocumentError,
+} from "../permissions/document.ts";
+import { resolvePermission } from "../permissions/resolve.ts";
 import { brainDirs, hookAuditDir, prefAuditDir } from "../paths.ts";
+import { BRAIN_CONFIG_TARGET } from "../schema-mutate.ts";
 import { schemaMutationAuditDir } from "../schema-integrity.ts";
 import { watchdogFallbackAuditDir } from "../watchdog.ts";
 import type { DoctorCheck } from "./check.ts";
@@ -263,6 +271,107 @@ export const syncConflictLogCheck: DoctorCheck = {
 
 /** Subsystem name the sync-conflict listing reports an unreadable path under. */
 const SYNC_CONFLICT_SITE = "brain.doctor.syncConflictLog";
+
+/** The code of the {@link denyConsultedLanesCheck} finding. */
+export const DENY_CONSULTED_LANES_CODE = "deny-consulted-lanes";
+
+/**
+ * Write-side trust (PR #247 review M3 residual): which mutation lanes a
+ * document deny actually closes.
+ *
+ * The deny consult spread across lanes one release at a time - update and
+ * append first, then the signal and feedback lanes, then the destructive
+ * source-cleanup lane, now the schema-mutation lane - while the release
+ * notes named only the first two.
+ * When the document in force DENIES the locally configured agent the
+ * `ingest` action, the cleanup refusals are therefore easy to misread as
+ * faults rather than policy. This check names the covered lanes at the one
+ * surface an operator runs to find out what is wrong, resolving the SAME
+ * subject the consults fall back to (`resolveAgentName`, `via: config`,
+ * the `ingest` action, the resolver's own precedence table), so it
+ * fires only when a real write from this machine would actually be
+ * refused. An unreadable document is the permissions check's finding, not
+ * this one's, so it stays silent here.
+ *
+ * Target-scoped denies resolve the way the lanes do (PR #248 review L13):
+ * the cleanup consults with the source path and the schema lane with the
+ * pack target, so an untargeted resolution stayed silent while a document
+ * scoped its deny to one target. When the blanket verdict denies, the one
+ * lane-list finding covers every scope; otherwise each distinct target the
+ * document names (plus the schema pack's own) resolves on its own, and a
+ * denied scope names the lane that consults it. The session-write lane is
+ * registered with its HONEST status: it consults no permissions document,
+ * so a deny does not reach it - coverage is not invented for it.
+ */
+export const denyConsultedLanesCheck: DoctorCheck = {
+  failSoft: true,
+  run({ vault, configPath }, { issues }) {
+    let document: ReturnType<typeof loadPermissionsDocument>["document"];
+    try {
+      document = loadPermissionsDocument(vault).document;
+    } catch (err) {
+      if (!(err instanceof PermissionsDocumentError)) throw err;
+      return;
+    }
+    if (document === null) return;
+    const agent = resolveAgentName(configPath);
+    const decision = resolvePermission(document, { agent, via: "config" }, "ingest");
+    if (decision.verdict === "deny") {
+      issues.push({
+        severity: "warning",
+        code: DENY_CONSULTED_LANES_CODE,
+        path: join(vault, PERMISSIONS_DOCUMENT_REL),
+        message: denyConsultedLanesMessage(agent, decision.source),
+      });
+      return;
+    }
+    // Blanket allow/ask: the scopes still answer one by one. The candidate
+    // targets are the ones the document itself names plus the schema lane's
+    // fixed pack target; the resolver's own precedence table decides each.
+    const targets = new Set<string>([BRAIN_CONFIG_TARGET]);
+    for (const entry of document.entries) {
+      if (entry.action === "ingest" && entry.target !== undefined) targets.add(entry.target);
+    }
+    for (const target of [...targets].toSorted()) {
+      const scoped = resolvePermission(document, { agent, via: "config" }, "ingest", target);
+      if (scoped.verdict !== "deny") continue;
+      issues.push({
+        severity: "warning",
+        code: DENY_CONSULTED_LANES_CODE,
+        path: join(vault, PERMISSIONS_DOCUMENT_REL),
+        message: denyTargetedMessage(agent, target, scoped.source),
+      });
+    }
+  },
+};
+
+/** The lane list a blanket ingest deny closes, and the one it does not reach. */
+function denyConsultedLanesMessage(agent: string, rule: string): string {
+  return (
+    `a permissions document denies ${JSON.stringify(agent)} the ingest action ` +
+    `(rule ${rule}). The lanes that consult the document and refuse on ` +
+    "deny include: source ingest (brain_ingest_source), the destructive source cleanup " +
+    "(delete_by_source: derived entries and the ingest manifest entry), the schema " +
+    "mutation lane (brain_schema_mutate: the Brain/_brain.yaml pack), and the " +
+    "ingest-lane review gate. The session-write lane (brain_write_session) consults " +
+    "no permissions document, so a deny does not reach it. Review the policy: " +
+    "o2b brain permissions show"
+  );
+}
+
+/** The one lane a target-scoped ingest deny closes at `target`. */
+function denyTargetedMessage(agent: string, target: string, rule: string): string {
+  const lane =
+    target === BRAIN_CONFIG_TARGET
+      ? "the schema mutation lane (brain_schema_mutate: the Brain/_brain.yaml pack)"
+      : "the destructive source cleanup (delete_by_source: derived entries and the ingest " +
+        "manifest entry) when it targets this source";
+  return (
+    `a permissions document denies ${JSON.stringify(agent)} the ingest action at ` +
+    `${target} (rule ${rule}). The lane that consults the document at this target and ` +
+    `refuses on deny is: ${lane}. Review the policy: o2b brain permissions show`
+  );
+}
 
 /**
  * The conflict copies under one ledger directory, or none plus a named

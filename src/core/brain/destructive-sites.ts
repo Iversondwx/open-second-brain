@@ -125,13 +125,29 @@ const UNARCHIVED_EXCLUDED: RecoverabilityFacts = Object.freeze({
 export const DESTRUCTIVE_SITES: Readonly<Record<string, DestructiveSiteDeclaration>> =
   Object.freeze({
     // --- Moves whose destination is proved before the source goes -------
-    "src/core/brain/pending.ts": {
+    // (`src/core/brain/pending.ts` stopped being a site when the
+    // multi-lane queue moved the engine into `pending/pending-lanes.ts`
+    // and the module became a pure delegation surface.)
+    "src/core/brain/pending/pending-lanes.ts": {
       calls: ["unlinkSync"],
       recovery: UNARCHIVED_BRAIN,
       reason:
-        "`atomicCreateFileSyncExclusive` lands the inbox copy and throws on a name " +
-        "collision BEFORE the unlink runs, so the record exists twice at the moment " +
-        "the source is removed and never zero times.",
+        "the multi-lane queue's apply and reject, generalized from the A3 applier: " +
+        "apply exclusive-creates the decoded publish target and throws on an occupied " +
+        "name BEFORE the staged copy is unlinked, so the document exists twice at that " +
+        "instant and never zero times; reject writes the retire-shaped render through " +
+        "`writeFrontmatterAtomic` and refuses an occupied retired name before the " +
+        "staged copy goes, preserving every original field beside the retire stamps.",
+    },
+    "src/core/brain/intake/extract-intake.ts": {
+      calls: ["unlinkSync"],
+      recovery: UNARCHIVED_BRAIN,
+      reason:
+        "the stage arm of the intake's disposition contract moves each CREATED entity page " +
+        "into the review queue: `stageForReview` lands the page's exact bytes on the staged " +
+        "entry FIRST and the canonical copy is unlinked second, so a crash between the two " +
+        "leaves both copies - the queue's apply names the occupied target - and never zero; " +
+        "the update arm never reaches this call.",
     },
     "src/core/brain/preference.ts": {
       calls: ["unlinkSync"],
@@ -362,6 +378,27 @@ export const DESTRUCTIVE_SITES: Readonly<Record<string, DestructiveSiteDeclarati
         "is deliberately outside every snapshot archive, so its safety comes from the " +
         "atomicity of the swap and not from a recovery point.",
     },
+    "src/core/brain/secrets/envelope.ts": {
+      calls: ["renameSync", "unlinkSync"],
+      recovery: UNARCHIVED_OUTSIDE,
+      reason:
+        "wraps the plaintext keyfile into a passphrase-verified envelope through a " +
+        "tmp-plus-rename swap that lands at mode 0600, and the unlink is only the tmp " +
+        "whose wrap failed, so the displaced bytes are the keyfile the envelope just " +
+        "replaced and the wrapping passphrase re-derives the key it protects - a lost " +
+        "passphrase is the documented, permanent loss. The custody state sits outside " +
+        "every snapshot archive by design.",
+    },
+    "src/core/brain/secrets/token-store.ts": {
+      calls: ["renameSync"],
+      recovery: UNARCHIVED_OUTSIDE,
+      reason:
+        "the tmp-plus-rename half of the per-agent MCP token store's write, which must " +
+        "land at mode 0600 at creation, so no shared writer serves it. The store is " +
+        "hash-at-rest by design: the bytes a rotation displaces are the previous hash " +
+        "and non-secret prefix, never a credential, and overwriting them is the rotate " +
+        "or revoke doing its job. Custody state sits outside every snapshot archive.",
+    },
 
     // --- Two-phase accept with a journalled rollback ---------------------
     "src/core/brain/skill-proposals.ts": {
@@ -403,6 +440,18 @@ export const DESTRUCTIVE_SITES: Readonly<Record<string, DestructiveSiteDeclarati
         "originals and manifest lists are all empty and the loops remove nothing. Recovery is " +
         "PARTIAL rather than covered because `--include-originals` removes the imported file " +
         "outside `Brain/`, which no archive has ever held.",
+    },
+    "src/core/brain/provenance/source-archive.ts": {
+      calls: ["rmSync"],
+      recovery: UNARCHIVED_BRAIN,
+      reason:
+        "`discardSourceArchive` removes one content-addressed entry from `Brain/.archives/` " +
+        "only when delete-by-source has established that its LAST citing page is in the same " +
+        "confirmed deletion - the caller owns that decision and this module cannot check it, " +
+        "which is the claim written down here. The confirmed delete-by-source run beside which " +
+        "the discard fires takes its D1 snapshot first, and `Brain/.archives/` is deliberately " +
+        "NOT a snapshot-excluded entry, so the bytes the removal takes are inside that run's " +
+        "recovery point even though this primitive never takes one of its own.",
     },
     "src/core/brain/notes/write-record.ts": {
       calls: ["unlinkSync"],

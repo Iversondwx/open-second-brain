@@ -292,8 +292,24 @@ through unchanged:
 - the frozen-vault refusal `vault_frozen`, the write-binding refusal
   `write-binding-refused`, the reach refusal `caller-supplied-reach`, and
   the owner-scope refusals `foreign-owner` and `unresolved-identity`;
+- the permissions-document write refusals (since 1.79.0): `write-refused`
+  (a document rule denied the write) and
+  `force-confirmed-requires-allow` (`force_confirmed` skipped the dream
+  trial window while the caller's document `write` verdict is not
+  `allow`); both resolve `next_command: "o2b brain permissions show"`,
+  the same re-derive loop the `permissions-unreadable` doctor finding
+  uses. The owner-write gate refuses with `owner_write_refused` (below)
+  and names the fix in its message: name the caller's own resolved
+  identity, or write without an explicit owner;
+- the staged-target conflict `pending-stage-conflict` (since 1.79.0): a
+  write retried while its first run is still staged, answered with the
+  queue entry holding the target (`existing_id`) and the `target` itself,
+  so a caller applies or rejects that entry instead of retrying into the
+  same wall;
 - the codes of write batches (`budget_exceeded`, `invalid_action`,
-  `invalid_target`, ...), note creation, note lifecycle, note revert,
+  `invalid_target`, ..., and since 1.79.0 the frontmatter
+  `owner_write_refused` guard), note creation (which carries the same
+  `owner_write_refused` guard), note lifecycle, note revert,
   stub scaffolding, note title resolution, note templates, pinned
   context, exact state, host memory writes, the count guard
   (`count_guard`), and the shared `config_invalid` and
@@ -307,7 +323,8 @@ The canonical list is `TOOL_ERROR_CODES` in `src/mcp/tool-error-codes.ts`.
 
 **Casing follows the vocabulary.** New tokens are lower snake_case. A
 code that was already on the wire keeps its spelling: search codes stay
-UPPER_SNAKE, the write-binding, reach and owner-scope refusals stay
+UPPER_SNAKE, the write-binding, reach, owner-scope and permissions-document
+write refusals stay
 kebab-case, and the `brain_expire` refusals keep their class names. Nothing was
 renamed, so a client that already matched `vault_frozen` or
 `budget_exceeded` keeps working.
@@ -361,12 +378,12 @@ flags for a narrower per-process full server.
 | `brain_audit`               | Read-only per-preference mutation trail (create / promote / update / retire / merge) with agent, reason, revision + content-hash before/after. | `pref_id`                                      |
 | `brain_brief`               | Read-only Brain summary for any window: `view: morning \| daily \| weekly \| monthly \| operator \| digest`.                                   | `view`                                         |
 | `brain_analytics`           | Read-only Brain analytics for any lens: `view: timeline \| attention_flows \| belief_evolution \| concept_synthesis \| dedup`. `view=dedup` summarises the persisted exact-hash ingest dedup records into a trend plus a per-source re-ingest ranking; every count is an exact sha-256 drop, never a semantic figure (the semantic detectors nominate merge candidates and never drop). | `view`                                         |
-| `brain_search`              | Read-only vault search with optional structured query lanes, explicit focus hints, time ranges, evidence-pack diagnostics, a selectable recall `profile` (`fast \| balanced \| thorough`), and an FTS `match_mode` (`all` \| `any`). | `query`                                        |
+| `brain_search`              | Read-only vault search with optional structured query lanes, explicit focus hints, time ranges, evidence-pack diagnostics, a selectable recall `profile` (`fast \| balanced \| thorough`), an FTS `match_mode` (`all` \| `any`), and since v1.80.0 a pushed `kind` filter (`page` \| `section`) plus SQL pushdown for the promoted `properties` keys. | `query`                                        |
 | `brain_recall_feedback`     | Record explicit up/down recall feedback for one search result; feeds the deterministic learned-weight fold.                                     | `query`, `result_path`, `verdict`              |
 | `brain_recall_gate`         | Read-only classifier for whether an automatic recall attempt should run; returns `retrieve` plus a stable reason. When the caller passes `scores` AND `match_quality` (the `idf_weighted_coverage` a search outcome reports - the two stand or fall together, and an incomplete pair is refused), also attaches an adequacy verdict (`sufficient` \| `weak` \| `insufficient`), a recommended action (`proceed` \| `re_recall` \| `abstain`), and an optional `escalate` flag. The LEVEL is decided by `match_quality` alone; the scores decide only the usable-result count. Thresholds via `recall_adequacy_sufficient` / `recall_adequacy_weak` / `recall_adequacy_min_results`.                              | `prompt`                                       |
 | `brain_context_pack`        | Budgeted context slice; pass `lanes: true` to return directives, constraints, and consider lanes. Filtered items include `safety.reasons`. Each item carries a structural `epistemic` status (`observed` \| `derived` \| `hypothesis` \| `plan` \| `unknown`) plus `evidence_refs` derived from existing graph metadata; fields are absent when the status is `unknown`. Takes the same adequacy pair as `brain_recall_gate` under its own spelling, `recall_scores` AND `match_quality`: both or neither, an incomplete pair is refused, and the schema states it as `dependentRequired` keyed on this tool's own scores name. | `max_tokens`                                   |
 | `brain_context_receipts`    | List or show opt-in prompt context receipt continuity records with budgets, hashes, source refs, safety/redaction metadata, and item IDs.      | `operation`                                    |
-| `brain_recall_telemetry`    | List or summarise opt-in recall telemetry records for search, context-pack, and pre-compress calls.                                            | `operation`                                    |
+| `brain_recall_telemetry`    | List or summarise opt-in recall telemetry records for search, context-pack, and pre-compress calls; since v1.80.0 the `dead_weight` operation reports in-scope pages no recorded recall ever surfaced. | `operation`                                    |
 | `brain_route_metrics`       | List or summarise opt-in route-level MCP tool latency (`mcp_route_latency` records); `summary` rolls each tool up into count, error count, and min/avg/max + p50/p95/p99 latency, slowest-first, plus a per-stage count/avg/p95 for a route whose records carry write stages. Emitted only when `mcp_route_metrics_enabled` is on; payload-safe (tool, scope, status, duration, arg key names, stage names). Read-only. | `operation`                                    |
 | `brain_retrieval_plan`      | Shadow-only retrieval advisor for one `question`: composes query intent/weights, the summary-surface route, the context-pack density allocation, the token-impact ledger, and observed route p95 latency into a strategy, token-budget allocation, graph-expansion advice, reliability, and a marginal-value stop. Optional `token_budget`. Read-only; exposes no mutating parameters and changes no ranking. | `question`                                     |
 | `brain_token_impact`        | Durable value-of-memory ledger: `record` posts a context pack's tokenizer-exact prompt-token delta (`baseline` − `packed`, `method` exact/fallback) plus an optional modeled inference-avoidance estimate; `outcome` posts first-pass/repair/retry to calibrate the model; `summary` keeps EXACT prompt-token savings strictly separate from the MODELED (outcome-calibrated) figure; `list` reads raw samples. Writes gated on `token_impact_ledger_enabled` (default off); payload-safe (counts + opaque pack id only). Reads ignore the gate. | `operation`                                    |
@@ -377,7 +394,7 @@ flags for a narrower per-process full server.
 | `brain_agenda`              | Stateless agenda synthesis over caller-provided calendar events (the host fetches them; the Brain never calls a calendar API): overlap conflicts, free focus blocks (optionally clipped to a workday window), and events organised outside the operator's own email domain(s). No vault writes. | `events`                                       |
 | `brain_context_presets`     | Show, suggest, or diff read-only context budget presets (`tight-context`, `long-context`) without writing config.                              | `operation`                                    |
 | `brain_pre_compact_extract` | Extract decision/commitment/outcome/rule/open-question records from bounded text into continuity storage.                                      | `session_id`, `turn_start`, `turn_end`, `text` |
-| `brain_hygiene`             | Memory hygiene: `scan` findings (conflicts, dedup, freshness, usefulness; since v1.64.0 `slug-collisions` is default-on — same-stem allocation residue such as `topic.md` beside `topic-2.md` — and `tags` is opt-in, auditing inline body tags only, never frontmatter tags arrays; since v1.67.0 `capture-scope` is default-on and warns when active knowledge rests only on `url-only` sources; the default is the sweep of every registered detector except the opt-in ones), `apply` selected ids, `refresh` stale pages. Resolver command comes from `_brain.yaml` only. When `hygiene_digest_enabled` is on in the machine config, the same default-sweep findings are also pushed at turn end as a one-line digest (Stop hook, once per change), so this pull surface doubles as a push channel. With the optional `dedup` decision-model use in enforce, `scan` dedup findings carry an advisory `decision_model` verdict; `apply` never reads it. | `mode`                                         |
+| `brain_hygiene`             | Memory hygiene: `scan` findings (conflicts, dedup, freshness, usefulness; since v1.64.0 `slug-collisions` is default-on — same-stem allocation residue such as `topic.md` beside `topic-2.md` — and `tags` is opt-in, auditing inline body tags only, never frontmatter tags arrays; since v1.67.0 `capture-scope` is default-on and warns when active knowledge rests only on `url-only` sources; the default is the sweep of every registered detector except the opt-in ones), `apply` selected ids, `refresh` stale pages; since v1.81.0 `archive_get` resolves an ingest summary's `source_archive_hash` to its archived bytes under `Brain/.archives/` (local reach only, and the `capture-scope` scan also names a cited source whose archive entry is missing or mismatched). Resolver command comes from `_brain.yaml` only. When `hygiene_digest_enabled` is on in the machine config, the same default-sweep findings are also pushed at turn end as a one-line digest (Stop hook, once per change), so this pull surface doubles as a push channel. With the optional `dedup` decision-model use in enforce, `scan` dedup findings carry an advisory `decision_model` verdict; `apply` never reads it. | `mode`                                         |
 | `brain_anticipatory_context` | Turn-specific context bundle kept warm by lifecycle hooks, keyed by the session's lineage root; reports `cache_state` warm / stale / miss.   | `session_id`                                   |
 | `brain_session_grep`        | Search imported session recall raw turns and deterministic summary nodes.                                                                      | `query`                                        |
 | `brain_session_describe`    | Describe raw-turn counts and summary depths for one imported session recall DAG.                                                               | `session_id`                                   |
@@ -467,6 +484,20 @@ than it handed you. Read it as candidates ranked, not as a corpus
 statistic: the pool is capped at roughly three times the requested
 `limit`, so it moves with `limit` and saturates on a large vault, and
 link traversal can add a document that matched no term at all.
+Since v1.80.0 `brain_search` accepts `kind: "page"|"section"`, pushed into
+the store's SQL on both lanes (keyword: before `ORDER BY`/`LIMIT`;
+semantic: inside the overfetch window). Property pushdown is
+conditional-faithful: `type` pushes the scalar declared values as the
+normalized token the index stores, `pinned` pushes only for `true`,
+`visibility` pushes its normalized tokens, while `tags` and any non-scalar
+shape stay post-rank filters judged against the live file. Every other key
+narrows the candidate pool against the indexed `document_attributes`
+snapshot - a provable mismatch drops out in SQL, the bounded table never
+speaks where it holds no rows, and the live filter still judges every
+surfaced row. A pushed filter answers AS INDEXED - the indexed snapshot,
+like the content itself - so a page edited after the last index run is
+judged by its indexed frontmatter until the next run. See
+[`docs/cli-reference.md`](cli-reference.md#kind-and-property-pushdown-since-v1800).
 A deterministic summary-search router (t_7b96f242) inspects each query for
 structural summary signals - a source-targeted `source:<path>` token, or a
 `kind:<t>`/`type:<t>` token whose value is a declared artifact kind in the
@@ -484,7 +515,30 @@ and `telemetry`. `brain_context_receipts` supports `operation: "list"|"show"`;
 `brain_recall_telemetry` supports `operation: "list"|"summary"|"cost"` (`cost`
 folds write volume - feedback/apply-evidence/note plus host-bridge writes -
 against reads into a write-vs-read ratio, a `write_heavy` flag, and a rough
-weighted cost signal per period; tune with `write_cost`/`read_cost`/`write_heavy_ratio`);
+weighted cost signal per period; tune with `write_cost`/`read_cost`/`write_heavy_ratio`).
+Since v1.80.0 the same tool also answers `operation: "dead_weight"`: pages
+currently in scope that no recorded recall within the telemetry window ever
+surfaced - the complement of the recorded retrieved set against the vault
+walk, windowed by `since`/`until`, with the observation window, a capped
+dead-page list, and the gate caveat (telemetry is opt-in and records only
+surfaced top rows, so the report claims "no recorded retrieval surface",
+never absolute never) in every payload.
+Since v1.81.0 `brain_truth` `state` accepts an optional opaque `sample_id`
+(echoed verbatim on the committed event) and the `events` report hydrates
+the provenance behind it: the named context receipt's items plus the
+context-pack outcome row, resolved at the caller's reach - below local
+reach, receipt items whose injections came from operator rules stay
+hidden, a claim whose outcome never arrived renders "receipt known,
+outcome unknown", and rows without a `sample_id` stay byte-identical to
+before. `brain_ingest_source` in the trusted local lane archives the
+source's bytes content-addressed under `Brain/.archives/` (redacted
+before persist, refused past 1 MiB rather than truncated, never
+TTL-pruned), stamps `source_archive_hash` and `source_archive_bytes` on
+the summary page and returns `source_archive_hash`; delete-by-source
+cleanup removes the source's orphaned archive entries best-effort, and
+`brain_session_summary` `get` and `list` omit the `session_id` key of a
+digest that has no session instead of answering `""`, matching the
+no-session read rule every continuity reader applies.
 `brain_context_presets` supports `operation: "show"|"suggest"|"diff"`; and
 `brain_generation_reports` supports `action: "record"|"list"|"summary"` -
 `record` is gated (default off) by a per-call `enable` flag or the
@@ -714,8 +768,9 @@ Optional flags:
 
 The stdio server logs its banner to `stderr` and only writes JSON-RPC frames to
 `stdout`, so it is safe to use as a subprocess in any MCP client. HTTP refuses
-to start when `--host` is not loopback and no key was given (`--api-key` or
-`OPEN_SECOND_BRAIN_MCP_API_KEY`); with a key
+to start when `--host` is not loopback and neither a key (`--api-key` or
+`OPEN_SECOND_BRAIN_MCP_API_KEY`) nor a non-empty agent-token map is present;
+with a key
 configured it checks that key on every request using a generic constant-time
 comparison, and returns the same `401 Unauthorized` body for a
 missing or wrong key. JSON responses are the default; clients that send
@@ -723,6 +778,46 @@ missing or wrong key. JSON responses are the default; clients that send
 JSON-RPC response — one event, then the connection closes, which is why a
 progress token sent over HTTP is refused by name rather than honoured (see
 "Progress notifications" above).
+
+Since 1.79.0 the HTTP transport also answers per-agent credentials. `o2b mcp
+token mint` (or `o2b bootstrap --token`) mints a named token per agent into
+the vault's hash-at-rest store (`.open-second-brain/secrets/mcp-tokens.json`;
+only a sha-256 hash and a non-secret prefix are stored, the material is shown
+exactly once). A request whose `Authorization: Bearer` or `X-API-Key`
+credential matches a stored token authenticates as that token's agent for
+that one request - identity threads as a request parameter, never as server
+state, so concurrent callers with different tokens never observe each other's
+identity. The token map is consulted before the shared key; the shared key
+keeps authenticating with the process's configured agent name; and a revoked
+or unknown token gets the same generic `401` body as a missing credential, so
+no oracle distinguishes them. Rotation lands on the next request with no
+server restart and keeps the PREVIOUS material authenticating for a
+ten-minute placement window (`ROTATION_GRACE_MS` in the token store) so the
+caller holding it does not fail while the new one is being placed; after the
+window the old material dies on its own, with no revoke. Revocation itself
+stays immediate. Both are read per request behind an mtime cache; the shared
+key keeps its launch-time capture. The gate
+`mcp_tokens_required` (device config key or
+`OPEN_SECOND_BRAIN_MCP_TOKENS_REQUIRED`, default `false`) makes the endpoint
+refuse credential-less requests whenever a non-empty token map exists; with
+the key absent every credential-less posture - loopback keyless, non-loopback
+keyed - is unchanged, and one corner tightens everywhere: a presented
+credential that matches neither the token map nor the shared key is refused
+with the same generic `401` instead of degrading to anonymous, so a stale or
+forged bearer can never ride the keyless loopback posture. stdio identity
+stays config-derived (one caller per
+process that already owns the process tree). A token mints identity only,
+never reach: tool profiles and the reach ceiling still bind every caller
+regardless of credential.
+
+That boundary extends to `o2b bootstrap --token`: the registration bootstrap
+writes is the stdio payload above (`o2b mcp --vault ...`), which presents no
+credential, so the bootstrapped harness keeps its config-derived identity
+and the minted token changes nothing for it. The material authenticates
+HTTP MCP clients an operator configures by hand (`Authorization: Bearer` or
+`X-API-Key`) - the bootstrap output says the same beside every mint, and
+`o2b bootstrap --remove <target>` tears a provision down again (adapter
+uninstall, token revoked, receipt entry dropped).
 
 ## Shutdown and draining (since v1.50.0)
 
@@ -1521,7 +1616,11 @@ format characters), when it contains NUL, or when it exceeds the cap.
   `brain_lifecycle` (tombstone / supersede / temporal-replace / tip /
   curator), `brain_claims` (claim-graph queries: current truth,
   truth-at-instant, replaced-by, contested-by), `brain_decision`
-  (record / outcome / rate / list / compare / similar / history / recall),
+  (record / outcome / rate / list / compare / similar / history / recall,
+  plus the open-decision actions open / list_open / show_open / resolve /
+  discard that park a question with enumerated options at
+  `Brain/decisions/open-<slug>.md` and later mint the real decision page
+  through `resolve`),
   and `brain_tension` (detect / list / show / confirm / dismiss / resolve).
   Decision-change receipts store only accountable provenance; free-text
   hidden-reasoning fields are rejected by the closed schema.

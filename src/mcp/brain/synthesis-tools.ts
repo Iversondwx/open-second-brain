@@ -8,10 +8,11 @@
 
 import {
   appendSessionSummary,
-  getSessionSummary,
+  getSessionSummaryReport,
   listSessionSummaries,
   SessionSummaryError,
   type SessionSummaryDigest,
+  type SessionSummaryRecordRef,
 } from "../../core/brain/session-summary.ts";
 import {
   saveSessionCheckpoint,
@@ -73,7 +74,9 @@ const PROJECT_SCOPE_MAX_LEN = 128;
 function serializeDigest(digest: SessionSummaryDigest): Record<string, unknown> {
   return {
     id: digest.id,
-    session_id: digest.sessionId,
+    // Presence-gated with the digest shape (t_22d58fa7): a record naming
+    // no session carries no session_id key, never a fabricated "".
+    ...(digest.sessionId !== undefined ? { session_id: digest.sessionId } : {}),
     request: digest.request,
     decisions: digest.decisions,
     learnings: digest.learnings,
@@ -82,6 +85,11 @@ function serializeDigest(digest: SessionSummaryDigest): Record<string, unknown> 
     ...(digest.host !== undefined ? { host: digest.host } : {}),
     ...(digest.project !== undefined ? { project: digest.project } : {}),
   };
+}
+
+/** Wire shape of one divergence record: identity and hash, never a payload echo. */
+function serializeDivergenceRecord(record: SessionSummaryRecordRef): Record<string, unknown> {
+  return { id: record.id, created_at: record.createdAt, content_hash: record.contentHash };
 }
 
 async function toolBrainSessionSummary(
@@ -124,8 +132,23 @@ async function toolBrainSessionSummary(
 
   if (operation === "get") {
     const sessionId = requiredSessionId(args);
-    const digest = getSessionSummary(ctx.vault, sessionId);
-    return digest === null ? { found: false } : { found: true, digest: serializeDigest(digest) };
+    const report = getSessionSummaryReport(ctx.vault, sessionId);
+    if (report === null) return { found: false };
+    // Additive divergence fields (t_59d4c919): the count always; the
+    // divergent flag and the bounded id/hash sample only when the session
+    // holds more than one content-differing digest. `{ found: false }` is
+    // untouched.
+    return {
+      found: true,
+      digest: serializeDigest(report.digest),
+      digest_count: report.digestCount,
+      ...(report.divergent === true
+        ? {
+            divergent: true,
+            records: (report.records ?? []).map(serializeDivergenceRecord),
+          }
+        : {}),
+    };
   }
 
   // operation === "list"

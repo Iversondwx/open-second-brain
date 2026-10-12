@@ -56,6 +56,8 @@ import { entityRegistryCheck } from "./doctor/entity-checks.ts";
 import { brokenBacklinkCheck } from "./doctor/link-checks.ts";
 import { mergeChainDanglingCheck } from "./doctor/merge-chain-check.ts";
 import { orphanSessionCheck } from "./doctor/orphan-session-check.ts";
+import { permissionsDocumentCheck } from "./doctor/permissions-check.ts";
+import { sessionIdentityCheck } from "./doctor/session-identity-check.ts";
 import { evidenceRangeCheck, logShardCheck, orphanEvidenceCheck } from "./doctor/log-checks.ts";
 import {
   contentHashDriftCheck,
@@ -91,6 +93,7 @@ import { logChainCheck } from "./doctor/log-chain-check.ts";
 import { checkSemanticHealth } from "./doctor/semantic-health-check.ts";
 import {
   danglingWorkrunCheck,
+  denyConsultedLanesCheck,
   freshenFailureCheck,
   symlinkEscapeCheck,
   syncConflictLogCheck,
@@ -197,6 +200,10 @@ const DOCTOR_CHECKS: ReadonlyArray<DoctorCheck> = Object.freeze([
   evidenceRangeCheck,
   orphanEvidenceCheck,
   orphanSessionCheck,
+  // The blank-identity count reads the same ledger the orphan check's
+  // resolution half reads, so the two session-identity checks report
+  // adjacently.
+  sessionIdentityCheck,
   entityRegistryCheck,
   capturePatternCheck,
   syncConflictLogCheck,
@@ -215,6 +222,8 @@ const DOCTOR_CHECKS: ReadonlyArray<DoctorCheck> = Object.freeze([
   embeddingsHealthCheck,
   rerankHealthCheck,
   payloadRegistryCheck,
+  permissionsDocumentCheck,
+  denyConsultedLanesCheck,
 ]);
 
 // ----- Entry point ----------------------------------------------------------

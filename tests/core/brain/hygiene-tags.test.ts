@@ -8,8 +8,10 @@
  * rule rejects (reported as the diff: the index will never match them);
  * inconsistent - the same tag differing by case or hierarchy depth;
  * orphan - a tag value on exactly one document. Frontmatter `tags:`
- * arrays are OUT of scope (recorded refusal), and the detector is
- * opt-in: registered but excluded from `DEFAULT_SCAN_IDS`.
+ * arrays are OUT of scope here (recorded refusal) - the trust-surface-
+ * hardening wave gives them their own opt-in `frontmatter-tags`
+ * detector - and this detector is opt-in too: registered but excluded
+ * from `DEFAULT_SCAN_IDS`.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -53,28 +55,27 @@ function byClass(findings: ReadonlyArray<HygieneFinding>, klass: string): Hygien
 }
 
 describe("tags detector - malformed", () => {
-  test("reports a body tag the looser Obsidian rule accepts but the index rule rejects", () => {
+  test("digit-led non-numeric tokens the old onset refused now ride the index (v1.78.0 review round)", () => {
     writeNote("Brain/notes/a.md", "#shared start");
     writeNote("Brain/notes/b.md", "#shared and #2024notes here");
+    // The index absorbs the token the letter/underscore onset used to
+    // drop, so there is no index loss left to report.
     const malformed = byClass(tagsFindings(), "malformed");
-    expect(malformed).toHaveLength(1);
-    const finding = malformed[0]!;
-    expect(finding.detector).toBe("tags");
-    expect(finding.severity).toBe("info");
-    expect(finding.proposed_action).toBe("review");
-    expect(finding.evidence.tag).toBe("#2024notes");
-    expect(typeof finding.evidence.reason).toBe("string");
-    expect(finding.targets).toEqual(["Brain/notes/b.md", "#2024notes"]);
-    expect(finding.title).toBe("Malformed tag: the index will never match #2024notes");
-  });
-
-  test("the reported token is genuinely absent from the index extraction (the diff)", () => {
-    const body = "#shared and #2024notes here";
-    const values = extractLinks(body)
+    expect(malformed).toHaveLength(0);
+    const values = extractLinks("#shared and #2024notes here")
       .filter((l) => l.linkType === "tag")
       .map((l) => l.linkText);
     expect(values).toContain("shared");
-    expect(values).not.toContain("2024notes");
+    expect(values).toContain("2024notes");
+  });
+
+  test("Unicode tokens ride the index too and are not reported malformed", () => {
+    writeNote("Brain/notes/a.md", "#кодинг note");
+    expect(byClass(tagsFindings(), "malformed")).toHaveLength(0);
+    const values = extractLinks("#кодинг note")
+      .filter((l) => l.linkType === "tag")
+      .map((l) => l.linkText);
+    expect(values).toContain("кодинг");
   });
 
   test("tokens both rules reject (pure numeric) are not reported", () => {
@@ -87,14 +88,18 @@ describe("tags detector - malformed", () => {
     expect(tagsFindings()).toHaveLength(0);
   });
 
-  test("the same malformed token across documents is one finding; distinct tokens stay distinct", () => {
+  test("the same digit-led token across documents is indexed, not reported", () => {
     writeNote("Brain/notes/a.md", "#2024notes one");
     writeNote("Brain/notes/b.md", "#2024notes two");
     writeNote("Brain/notes/c.md", "#3d-print two");
-    const malformed = byClass(tagsFindings(), "malformed");
-    expect(malformed).toHaveLength(2);
-    const grouped = malformed.find((f) => f.evidence.tag === "#2024notes");
-    expect(grouped!.targets).toEqual(["Brain/notes/a.md", "Brain/notes/b.md", "#2024notes"]);
+    const findings = tagsFindings();
+    // The malformed class is empty: both digit-led tokens ride the index.
+    // #2024notes is shared across two documents; #3d-print sits on one,
+    // so the orphan class - not the malformed class - owns the finding.
+    expect(byClass(findings, "malformed")).toHaveLength(0);
+    const orphans = byClass(findings, "orphan");
+    expect(orphans).toHaveLength(1);
+    expect(orphans[0]!.evidence.tag).toBe("#3d-print");
   });
 
   test("code fences and inline code spans are never audited", () => {
@@ -217,9 +222,12 @@ describe("tags detector - empty vault", () => {
 });
 
 describe("the one shared tag rule", () => {
-  test("TAG_RE keeps the incumbent pattern exactly (never widened)", () => {
-    expect(TAG_RE.source).toBe("(^|[^\\w/])#([A-Za-z_][\\w\\-/]*)");
+  test("TAG_RE keeps the Obsidian-grammar pattern exactly (v1.78.0 review round)", () => {
+    expect(TAG_RE.source).toBe(
+      "(^|[^\\w/])#(?!\\/)(?!\\p{Nd}+(?![\\p{L}\\p{N}_\\-/]))([\\p{L}\\p{N}_\\-/]+)",
+    );
     expect(TAG_RE.flags).toContain("g");
+    expect(TAG_RE.flags).toContain("u");
   });
 
   test("the shared extraction matches the index behavior the links tests pin", () => {
@@ -234,6 +242,10 @@ describe("tags scan integration", () => {
     expect(HYGIENE_DETECTOR_IDS).toContain("tags");
   });
 
+  test("the frontmatter sibling is registered in the closed tuple (t_11ee559f)", () => {
+    expect(HYGIENE_DETECTOR_IDS).toContain("frontmatter-tags");
+  });
+
   test("the default sweep excludes tags (opt-in only)", () => {
     writeNote("Brain/notes/a.md", "#2024notes malformed");
     const report = runHygieneScan(vault, { now: NOW });
@@ -242,8 +254,16 @@ describe("tags scan integration", () => {
     expect(report.findings.find((f) => f.detector === "tags")).toBeUndefined();
   });
 
+  test("the default sweep excludes the frontmatter sibling too (t_11ee559f)", () => {
+    writeNote("Brain/notes/fm.md", "body", "tags: [bad tag]");
+    const report = runHygieneScan(vault, { now: NOW });
+    expect(report.detectors_run).not.toContain("frontmatter-tags");
+    expect(report.counts["frontmatter-tags"]).toBeUndefined();
+    expect(report.findings.find((f) => f.detector === "frontmatter-tags")).toBeUndefined();
+  });
+
   test("an explicit subset runs tags alone", () => {
-    writeNote("Brain/notes/a.md", "#2024notes malformed");
+    writeNote("Brain/notes/a.md", "#solo token");
     const report = runHygieneScan(vault, { detectors: ["tags"], now: NOW });
     expect(report.detectors_run).toEqual(["tags"]);
     expect(report.counts.tags).toBe(1);

@@ -26,10 +26,34 @@ import type { Writable } from "node:stream";
 
 import { MCPServer, type MCPServerOptions, type MCPServerRuntimeOptions } from "./server.ts";
 import { errorResponse, internalErrorResponse, type JsonRpcResponse } from "./server.ts";
+import type { RequestIdentity } from "./server.ts";
 import { INVALID_REQUEST, PARSE_ERROR } from "./protocol.ts";
 import { DRAIN_STATE, RequestDrain, resolveDrainDeadlineMs, type DrainOutcome } from "./drain.ts";
 import { ORIGIN_CHANNEL, setOriginChannel } from "../core/origin-channel.ts";
 import { TRANSPORT_REACH, type TransportReach } from "../core/graph/transport-reach.ts";
+import { discoverConfig, resolveAgentName } from "../core/config.ts";
+import { hasAnyAgentToken, resolveAgentForToken } from "../core/brain/secrets/token-store.ts";
+
+export type { RequestIdentity };
+
+/**
+ * Device-config switch behind which the endpoint refuses credential-less
+ * requests once a token map exists (write-side-trust, Task 7). Default
+ * off, so every posture that predates tokens is byte-identical; with an
+ * empty map the key only warns at startup (`o2b mcp`).
+ */
+export const MCP_TOKENS_REQUIRED_CONFIG_KEY = "mcp_tokens_required";
+export const MCP_TOKENS_REQUIRED_ENV_KEY = "OPEN_SECOND_BRAIN_MCP_TOKENS_REQUIRED";
+
+/** Flat device key with an env twin, resolved exactly like `write_approval.enabled`. */
+export function resolveMcpTokensRequired(configPath?: string): boolean {
+  const env = process.env[MCP_TOKENS_REQUIRED_ENV_KEY];
+  const raw =
+    env !== undefined && env !== ""
+      ? env
+      : discoverConfig(configPath).data[MCP_TOKENS_REQUIRED_CONFIG_KEY];
+  return typeof raw === "string" && raw.trim().toLowerCase() === "true";
+}
 
 /**
  * The process-level fault counts a served transport reports on `/health`.
@@ -50,6 +74,18 @@ export interface ServeHttpOptions {
   readonly host?: string;
   readonly port?: number;
   readonly apiKey?: string | null;
+  /**
+   * The `mcp_tokens_required` decision for this bind. Absent resolves the
+   * device config key (env twin included) against the server's own
+   * config path; injected by `o2b mcp` and by tests so the flag is
+   * explicit at the surface that warns about it.
+   */
+  readonly tokensRequired?: boolean;
+  /**
+   * Where the transport writes its named warnings (a token store that
+   * cannot be read, for one). Defaults to the process stderr; injected
+   * so tests can pin what a degraded bind says.
+   */
   readonly stderr?: Writable;
   /**
    * How long {@link HttpServerHandle.close} waits for in-flight requests.
@@ -95,13 +131,20 @@ export async function startHttp(
   // Safe by default: on the loopback default a bearer is optional (the
   // loopback bind + Host/Origin rebinding guard are the baseline defence).
   // Binding to a NON-loopback interface exposes the Brain on the network, so
-  // a bearer is mandatory there - no permissive fallback.
-  if (!isLoopbackHost(host) && (apiKey === null || apiKey === "")) {
+  // a credential source is mandatory there - the shared key, or a non-empty
+  // per-agent token map (write-side-trust, Task 7). No permissive fallback.
+  if (!isLoopbackHost(host) && !hasCredentialSource(apiKey, ctx.vault)) {
     throw new Error(
-      "HTTP MCP transport bound to a non-loopback host requires --api-key " +
-        `(host=${host}); refusing to expose an unauthenticated endpoint on the network`,
+      "HTTP MCP transport bound to a non-loopback host requires --api-key or at least one " +
+        `minted agent token (host=${host}); refusing to expose an unauthenticated endpoint on the network`,
     );
   }
+  // Enforcement is an explicit operator key (default off), resolved once
+  // per bind like the shared key; the non-empty-map half of the condition
+  // is re-read per request behind the store's mtime cache, so minting the
+  // first token tightens a running server without a restart.
+  const tokensRequired =
+    opts.tokensRequired ?? resolveMcpTokensRequired(ctx.configPath ?? undefined);
   const port = opts.port ?? 0;
   // A transport fact, set after the caller's runtime options for the same
   // reason `sendNotification` is on stdio: a runtime option must not be
@@ -135,7 +178,17 @@ export async function startHttp(
     // shutdown then waits for a client that is waiting for it.
     res.on("close", finish);
     try {
-      await handleHttpRequest(mcp, apiKey, host, drain, opts.faultCounts, req, res);
+      await handleHttpRequest(
+        mcp,
+        apiKey,
+        tokensRequired,
+        host,
+        drain,
+        opts.faultCounts,
+        opts.stderr ?? process.stderr,
+        req,
+        res,
+      );
     } catch (exc) {
       // This promise used to be floated. A throw from the dispatch left
       // the socket open with no response on it and no record anywhere;
@@ -241,9 +294,11 @@ export async function serveHttp(
 async function handleHttpRequest(
   mcp: MCPServer,
   apiKey: string | null,
+  configTokensRequired: boolean,
   boundHost: string,
   drain: RequestDrain,
   faultCounts: (() => McpFaultCounts) | undefined,
+  stderr: Writable,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
@@ -301,9 +356,13 @@ async function handleHttpRequest(
     return;
   }
 
-  // Bearer is optional on loopback (guards are the baseline) but enforced when
-  // configured; a non-loopback bind always has a key (see startHttp).
-  if (apiKey !== null && apiKey !== "" && !authorized(req, apiKey)) {
+  // Credential resolution (write-side-trust, Task 7): the vault's token
+  // map first - a match mints the token's agent as the REQUEST identity -
+  // then the shared key, which keeps the process config identity. The
+  // generic 401 body is unchanged, and no answer distinguishes a revoked
+  // token from an unknown one.
+  const auth = authenticateHttpRequest(mcp, apiKey, configTokensRequired, boundHost, stderr, req);
+  if (auth.refused) {
     res.writeHead(401, { "content-type": "text/plain; charset=utf-8" });
     res.end("Unauthorized\n");
     return;
@@ -346,7 +405,10 @@ async function handleHttpRequest(
   }
 
   const jsonReq = request as Record<string, unknown>;
-  const response = await mcp.handleRequest(jsonReq);
+  // `HttpAuth.identity` is null for an anonymous request; the server's
+  // parameter is optional, and the two nulls are the same fact spelled
+  // in each module's own grammar.
+  const response = await mcp.handleRequest(jsonReq, auth.identity ?? undefined);
   if (response === null) {
     res.writeHead(204);
     res.end();
@@ -354,20 +416,170 @@ async function handleHttpRequest(
   }
   // No `mcp-session-id`. The header is a promise of per-session state, and
   // this transport has none: one MCPServer instance serves every request
-  // (see `startHttp`), identity and scope are process-global, and the id
-  // that used to be minted here was never read back on any later request.
-  // A client that received it would be entitled to expect the server to
-  // recognise it - and to be told 404 once it expired - so advertising one
-  // was a claim nothing behind it could honour.
+  // (see `startHttp`) and nothing is keyed by a session. What a request
+  // carries instead is the credential-minted identity, threaded through
+  // dispatch as a parameter - so the id that used to be minted here would
+  // still be advertising state nothing behind it reads. A client that
+  // received it would be entitled to expect the server to recognise it -
+  // and to be told 404 once it expired - so advertising one was a claim
+  // nothing behind it could honour.
   const accept = String(req.headers.accept ?? "");
   if (accept.includes("text/event-stream")) writeSse(res, response);
   else writeJson(res, response);
 }
 
-function authorized(req: IncomingMessage, apiKey: string): boolean {
-  const presented = bearerToken(req.headers.authorization) ?? firstHeader(req.headers["x-api-key"]);
-  if (presented === undefined) return false;
-  return constantTimeEqual(presented, apiKey);
+/**
+ * Whether a credential was presented at all, from either header a client
+ * uses. The shared-key gate's original reader, now also the fast-path
+ * probe the token wiring uses to keep credential-less anonymous traffic
+ * off the config and store reads it would never need.
+ */
+function presentedCredential(req: IncomingMessage): string | undefined {
+  return bearerToken(req.headers.authorization) ?? firstHeader(req.headers["x-api-key"]);
+}
+
+/** The per-request answer of one HTTP request's credential check. */
+interface HttpAuth {
+  /** The credential-minted identity, or `null` for an anonymous request. */
+  readonly identity: RequestIdentity | null;
+  /** True when the request must be refused with the generic 401. */
+  readonly refused: boolean;
+}
+
+/**
+ * Resolve one request's credential against the token map and the shared
+ * key, and decide whether the request may proceed.
+ *
+ * The rules, in the order the transport has always applied them:
+ *
+ * - a presented credential matching the token map mints the token's
+ *   agent, `via: "token"`; the map is consulted first, so a credential
+ *   that also spells the shared key is a token;
+ * - a presented credential matching the shared key proceeds with the
+ *   process config identity, `via: "shared-key"` - the operator master
+ *   credential, byte-identical to the pre-token gate except that the
+ *   identity now rides the request;
+ * - a presented credential matching neither is refused outright: a wrong
+ *   credential never degrades to anonymous, whatever the bind. The
+ *   pre-token gate refused it whenever a key was configured; this gate
+ *   refuses it everywhere, because treating a presented credential as
+ *   absence would let a stale or forged bearer ride the loopback's
+ *   anonymous posture;
+ * - a credential-less request proceeds anonymous unless tokens are
+ *   required - which is the config key AND a non-empty map, or a key-less
+ *   non-loopback bind, where the requirement is the bind itself and
+ *   holds whatever the map holds: revoking the last token must not
+ *   re-open anonymous access an exposed bind never promised.
+ *
+ * A token store that cannot be READ never widens this gate for a
+ * PRESENTED credential: the match falls through to the shared key with
+ * the failure named on stderr - a corrupt store must not lock the
+ * operator's master credential out of its own server. The enforcement
+ * probe fails the other way: when enforcement was requested (the config
+ * key or a key-less exposed bind), an unreadable map is treated as
+ * non-empty, so a credential-less request is refused rather than waved
+ * through - the requirement must not depend on the store's readability.
+ *
+ * The store probes sit behind the flags that need them: a loopback bind
+ * with no requirement and no presented credential reads nothing.
+ */
+function authenticateHttpRequest(
+  mcp: MCPServer,
+  apiKey: string | null,
+  configTokensRequired: boolean,
+  boundHost: string,
+  stderr: Writable,
+  req: IncomingMessage,
+): HttpAuth {
+  const hasKey = apiKey !== null && apiKey !== "";
+  const networkBare = !isLoopbackHost(boundHost) && !hasKey;
+  let mapNonEmpty = false;
+  if (configTokensRequired || networkBare) {
+    try {
+      mapNonEmpty = hasAnyAgentToken(mcp.vault);
+    } catch (err) {
+      warnTokenStoreUnreadable(stderr, err);
+      // Enforcement was REQUESTED (the config key, or the exposed bind),
+      // so an unreadable map must not read as an empty one: fail closed
+      // and refuse what the requirement would have refused. The shared
+      // key still answers - see the presented-credential catch below.
+      mapNonEmpty = true;
+    }
+  }
+  const enforced = networkBare || (configTokensRequired && mapNonEmpty);
+  const presented = presentedCredential(req);
+  const identity = authenticateRequest(req, {
+    apiKey,
+    resolveToken: (candidate) => {
+      try {
+        return resolveAgentForToken(mcp.vault, candidate);
+      } catch (err) {
+        warnTokenStoreUnreadable(stderr, err);
+        // Null, not a throw: the presented credential then fails the way
+        // any unmatched one does (the generic 401, no oracle), and a
+        // matching shared key still authenticates.
+        return null;
+      }
+    },
+    sharedKeyAgent: resolveAgentName(mcp.configPath ?? undefined),
+  });
+  return {
+    identity,
+    refused: identity === null && (presented !== undefined || enforced || hasKey),
+  };
+}
+
+/** The one named stderr line a failed token-store read produces. */
+function warnTokenStoreUnreadable(stderr: Writable, err: unknown): void {
+  stderr.write(
+    `warning: the MCP token store could not be read; token matching is off for this ` +
+      `request and the shared key still answers: ${(err as Error).message}\n`,
+  );
+}
+
+export interface AuthenticateRequestOptions {
+  /**
+   * The shared operator key, launch-captured. `null` or `""` means none
+   * is configured, and no key match is possible.
+   */
+  apiKey: string | null;
+  /**
+   * The vault's token map, mtime-cached by the store, so a rotation or
+   * revocation lands on the next request without a restart.
+   */
+  resolveToken: (presented: string) => { agent: string } | null;
+  /**
+   * The process config identity a shared-key match carries. Optional;
+   * without it the ambient `resolveAgentName()` answers, which is the
+   * same resolution the process context makes.
+   */
+  sharedKeyAgent?: string;
+}
+
+/**
+ * Token map first, then the shared key (identity = the process config
+ * name), else `null`. A presented-but-unmatched credential and an absent
+ * one both answer `null` - the refusal is the caller's decision, so no
+ * answer here ever distinguishes a revoked token from an unknown one.
+ */
+export function authenticateRequest(
+  req: IncomingMessage,
+  opts: AuthenticateRequestOptions,
+): RequestIdentity | null {
+  const presented = presentedCredential(req);
+  if (presented === undefined) return null;
+  const tokenAgent = opts.resolveToken(presented);
+  if (tokenAgent !== null) return { agent: tokenAgent.agent, via: "token" };
+  if (opts.apiKey !== null && opts.apiKey !== "" && constantTimeEqual(presented, opts.apiKey)) {
+    return { agent: opts.sharedKeyAgent ?? resolveAgentName(), via: "shared-key" };
+  }
+  return null;
+}
+
+/** Whether the bind would have any credential source to demand. */
+function hasCredentialSource(apiKey: string | null, vault: string): boolean {
+  if (apiKey !== null && apiKey !== "") return true;
+  return hasAnyAgentToken(vault);
 }
 
 /** Canonical loopback host names a rebinding guard trusts. */

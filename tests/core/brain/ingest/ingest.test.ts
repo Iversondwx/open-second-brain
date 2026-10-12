@@ -26,8 +26,29 @@ import {
   PRE_EXTRACT_MAX_SOURCE_BYTES,
   readSourceBounded,
 } from "../../../../src/core/brain/ingest/ingest.ts";
-import { manifestPath } from "../../../../src/core/brain/ingest/content-manifest.ts";
+import { manifestPath, hashBytes } from "../../../../src/core/brain/ingest/content-manifest.ts";
+import { computeExtractionContractFingerprint } from "../../../../src/core/brain/ingest/contract.ts";
 import { computePlanId, readCheckpoint } from "../../../../src/core/brain/ingest/checkpoint.ts";
+import {
+  applyPendingLane,
+  listPendingLane,
+  WriteRefusedError,
+} from "../../../../src/core/brain/pending/pending-lanes.ts";
+import { REVIEW_LANE } from "../../../../src/core/brain/write-gate.ts";
+import { entityPath } from "../../../../src/core/brain/paths.ts";
+import { canonicalNotePath } from "../../../../src/core/path-safety.ts";
+import { queryDecisionLedger } from "../../../../src/core/brain/permissions/ledger.ts";
+import { deleteBySource } from "../../../../src/core/brain/source-cleanup.ts";
+import { readManifest } from "../../../../src/core/brain/ingest/content-manifest.ts";
+
+function readManifestEntries(): string[] {
+  return Object.keys(readManifest(vault).entries);
+}
+
+/** The canonical vault-relative path of a created entity's page. */
+function canonicalPage(category: string, id: string): string {
+  return canonicalNotePath(relative(vault, entityPath(vault, category, id)));
+}
 
 let vault: string;
 let configHome: string;
@@ -138,7 +159,11 @@ describe("ingestSource", () => {
   test("planId records the ingested vault-file source into the plan checkpoint (t_ba1fa5f6)", () => {
     // The checkpoint is only recorded for a real vault file, so materialize it.
     seedSourceFile();
-    const planId = computePlanId("Articles", ["Articles/restaking-primer.md"]);
+    const planId = computePlanId(
+      "Articles",
+      ["Articles/restaking-primer.md"],
+      computeExtractionContractFingerprint(vault),
+    );
     ingestSource(vault, INPUT, { agent: "claude", now: NOW, planId });
     const cp = readCheckpoint(vault, planId);
     expect(cp?.completed).toEqual(["Articles/restaking-primer.md"]);
@@ -146,7 +171,11 @@ describe("ingestSource", () => {
 
   test("without planId no checkpoint is written", () => {
     seedSourceFile();
-    const planId = computePlanId("Articles", ["Articles/restaking-primer.md"]);
+    const planId = computePlanId(
+      "Articles",
+      ["Articles/restaking-primer.md"],
+      computeExtractionContractFingerprint(vault),
+    );
     ingestSource(vault, INPUT, { agent: "claude", now: NOW });
     expect(readCheckpoint(vault, planId)).toBeNull();
   });
@@ -440,5 +469,246 @@ describe("readSourceBounded", () => {
       text: null,
       unread: "not a regular file",
     });
+  });
+});
+
+describe("ingestSource — extraction contract (t_586d5d8b)", () => {
+  test("ingesting under a v1 manifest rewrites the summary and lands the manifest as v3", () => {
+    seedSourceFile();
+    // Pre-fingerprint era manifest: the source's live hash recorded, no
+    // contract. The ingest records the source under the live contract, so the
+    // manifest it rewrites must land as v3 stamped with the fingerprint.
+    writeManifestBytes(
+      JSON.stringify({
+        schema_version: 1,
+        entries: {
+          [INPUT.sourcePath]: hashBytes(readFileSync(join(vault, INPUT.sourcePath))),
+        },
+      }),
+    );
+
+    const res = ingestSource(vault, INPUT, { agent: "claude", now: NOW });
+    expect(res.created).toBe(true);
+    expect(readSummary(res.summaryPath)).toContain("kind: brain-source");
+
+    const onDisk = JSON.parse(readFileSync(manifestPath(vault), "utf8")) as {
+      schema_version: number;
+      contract: { fingerprint: string } | null;
+    };
+    expect(onDisk.schema_version).toBe(3);
+    expect(onDisk.contract?.fingerprint).toBe(computeExtractionContractFingerprint(vault));
+  });
+});
+
+/**
+ * The review gate (write-side trust, Task 9): the FIRST publish of a
+ * summary page stages under the ingest lane and the intake's created
+ * entity pages stage beside it, so a staged ingest publishes nothing -
+ * except the manifest row, which owes the stage verdict like every other
+ * registration row of the write and stays unrecorded until a publish arm
+ * lands; a re-ingest of an already-published page stays direct; and a
+ * source cleanup removes the staged page the way it removes a published
+ * one.
+ */
+describe("ingestSource under the ingest review gate", () => {
+  const INGEST_ENV = "OPEN_SECOND_BRAIN_WRITE_APPROVAL_INGEST_ENABLED";
+  let saved: string | undefined;
+
+  beforeEach(() => {
+    saved = process.env[INGEST_ENV];
+    process.env[INGEST_ENV] = "true";
+  });
+
+  afterEach(() => {
+    if (saved === undefined) delete process.env[INGEST_ENV];
+    else process.env[INGEST_ENV] = saved;
+    saved = undefined;
+  });
+
+  test("a first ingest stages the summary page while registration completes", () => {
+    seedSourceFile();
+    const res = ingestSource(vault, INPUT, { agent: "claude", now: NOW });
+    expect(res.staged).toBe(true);
+    expect(res.pendingId).toBeDefined();
+    // The publish target is untouched; the bytes sit in the queue.
+    expect(existsSync(join(vault, res.summaryPath))).toBe(false);
+    const stagedPath = join(vault, "Brain/pending/ingest", `${res.pendingId}.md`);
+    const stagedBytes = readFileSync(stagedPath, "utf8");
+    expect(stagedBytes).toContain("kind: brain-source");
+    expect(stagedBytes).toContain("An overview of restaking");
+    // Nothing of a staged ingest publishes ahead of review (the intake's
+    // disposition contract): the created entity pages stage beside the
+    // summary at their canonical publish targets instead of entering the
+    // registry, and the manifest row owes the stage verdict like every
+    // other registration row of this write - a staged ingest must not
+    // record itself as done while its output awaits review.
+    expect(listEntities(vault, { category: "concept" })).toHaveLength(0);
+    const notesEntries = listPendingLane(vault, REVIEW_LANE.notes).entries;
+    expect(notesEntries.map((e) => e.publishTarget).toSorted()).toEqual(
+      res.entitiesCreated.map((id) => canonicalPage("concept", id)).toSorted(),
+    );
+    expect(readManifestEntries()).not.toContain(INPUT.sourcePath);
+  });
+
+  test("an apply of the staged page publishes byte-identical bytes", () => {
+    seedSourceFile();
+    const res = ingestSource(vault, INPUT, { agent: "claude", now: NOW });
+    const stagedBytes = readFileSync(
+      join(vault, "Brain/pending/ingest", `${res.pendingId}.md`),
+      "utf8",
+    );
+    const applied = applyPendingLane(vault, res.pendingId!);
+    expect(applied.path).toBe(join(vault, res.summaryPath));
+    expect(readFileSync(applied.path, "utf8")).toBe(stagedBytes);
+  });
+
+  test("a re-ingest of an already-published page stays direct", () => {
+    seedSourceFile();
+    const first = ingestSource(vault, INPUT, { agent: "claude", now: NOW });
+    // A staged ingest queues the summary AND its created entity pages, so
+    // "already published" means the operator applied every staged entry.
+    applyPendingLane(vault, first.pendingId!);
+    for (const entry of listPendingLane(vault, REVIEW_LANE.notes).entries) {
+      applyPendingLane(vault, entry.id);
+    }
+    const second = ingestSource(vault, INPUT, { agent: "claude", now: LATER });
+    expect(second.staged).toBeUndefined();
+    expect(existsSync(join(vault, second.summaryPath))).toBe(true);
+    // The queue is empty: nothing re-staged behind the published page.
+    expect(existsSync(join(vault, "Brain/pending/ingest", `${first.pendingId}.md`))).toBe(false);
+  });
+
+  test("a source cleanup removes the staged page like a published one", () => {
+    seedSourceFile();
+    const res = ingestSource(vault, INPUT, { agent: "claude", now: NOW });
+    expect(existsSync(join(vault, "Brain/pending/ingest", `${res.pendingId}.md`))).toBe(true);
+    const plan = deleteBySource(vault, INPUT.sourcePath, { confirm: true });
+    // The staged page is derived solely from this source (its bytes carry
+    // the same `source_path` the published page would), so the cleanup's
+    // trace finds it under Brain/pending/ingest/ and removes it.
+    const deleted = plan.deleted.map((path) => path.replaceAll("\\", "/"));
+    const stagedRelPath = join(vault, "Brain/pending/ingest", `${res.pendingId}.md`)
+      .slice(vault.length + 1)
+      .replaceAll("\\", "/");
+    expect(deleted).toContain(stagedRelPath);
+    expect(existsSync(join(vault, "Brain/pending/ingest", `${res.pendingId}.md`))).toBe(false);
+  });
+
+  /**
+   * Review M13: a relation from a PUBLISHED entity into one of this
+   * batch's staged pages used to be applied before staging, writing
+   * `[[new-id]]` into the published page - a link to an entity that
+   * exists only in the queue, left behind for good when the operator
+   * rejects the staged page. The staged ingest defers it instead, and a
+   * re-ingest while the first is still pending dedupes onto the open
+   * queue entries instead of staging duplicates.
+   */
+  const ANCHORED_INPUT = {
+    sourcePath: INPUT.sourcePath,
+    summary: "A summary anchoring a published entity.",
+    extraction: {
+      entities: [
+        { category: "concept", name: "Anchor" },
+        { category: "concept", name: "Fresh" },
+      ],
+      relations: [{ from: "Anchor", relation: "related", to: "Fresh" }],
+    },
+  };
+
+  function seedPublishedAnchor(): void {
+    seedSourceFile();
+    upsertEntity(vault, { category: "concept", name: "Anchor", agent: "claude", now: NOW });
+  }
+
+  test("a staged ingest defers a relation into a published page - no dangling link", () => {
+    seedPublishedAnchor();
+    const res = ingestSource(vault, ANCHORED_INPUT, { agent: "claude", now: NOW });
+    expect(res.staged).toBe(true);
+    // The published Anchor page names no entity that exists only in the queue.
+    const anchor = getEntity(vault, { category: "concept", query: "Anchor" });
+    expect(anchor?.relations ?? []).toEqual([]);
+    // The deferral surfaces on the ingest result for the publish flow.
+    expect(res.deferredRelations).toEqual([{ from: "Anchor", relation: "related", to: "Fresh" }]);
+    // One open entry per publish target: the summary and the one entity page.
+    expect(listPendingLane(vault, REVIEW_LANE.ingest).entries).toHaveLength(1);
+    expect(listPendingLane(vault, REVIEW_LANE.notes).entries).toHaveLength(1);
+  });
+
+  test("a re-ingest while the first is still pending dedupes the pending entries", () => {
+    seedPublishedAnchor();
+    const first = ingestSource(vault, ANCHORED_INPUT, { agent: "claude", now: NOW });
+    const second = ingestSource(vault, ANCHORED_INPUT, { agent: "claude", now: LATER });
+    // No duplicate entries: still one summary entry and one entity entry.
+    expect(listPendingLane(vault, REVIEW_LANE.ingest).entries).toHaveLength(1);
+    expect(listPendingLane(vault, REVIEW_LANE.notes).entries).toHaveLength(1);
+    // The re-ingest reports the SAME open entries, not new ones.
+    expect(second.pendingId).toBe(first.pendingId);
+    // The published page is still clean, and the re-created duplicate left
+    // no canonical orphan.
+    expect(getEntity(vault, { category: "concept", query: "Anchor" })?.relations ?? []).toEqual([]);
+    expect(getEntity(vault, { category: "concept", query: "Fresh" })).toBeNull();
+  });
+
+  test("after the queue applies, a re-ingest applies the deferred relation", () => {
+    seedPublishedAnchor();
+    const first = ingestSource(vault, ANCHORED_INPUT, { agent: "claude", now: NOW });
+    const freshId = first.entitiesCreated[0]!;
+    applyPendingLane(vault, first.pendingId!);
+    for (const entry of listPendingLane(vault, REVIEW_LANE.notes).entries) {
+      applyPendingLane(vault, entry.id);
+    }
+    // Both endpoints are published now: the same extraction applies the
+    // edge instead of deferring it.
+    const second = ingestSource(vault, ANCHORED_INPUT, { agent: "claude", now: LATER });
+    expect(second.deferredRelations).toBeUndefined();
+    expect(second.staged).toBeUndefined();
+    const anchor = getEntity(vault, { category: "concept", query: "Anchor" });
+    expect(anchor?.relations).toEqual([{ relation: "related", target: freshId }]);
+  });
+});
+
+/**
+ * The document-backed disposition (write-side trust, Task 12): a
+ * permissions document that denies the ingest action refuses
+ * `brain_ingest_source` BEFORE any write - no entity page, no manifest
+ * row, no summary page, no queue entry - and lands exactly one
+ * decision-ledger row naming the rule that decided.
+ */
+describe("ingestSource under a denying permissions document", () => {
+  test("a deny default refuses the ingest before any write", () => {
+    seedSourceFile();
+    writeFileSync(join(vault, "Brain/_permissions.yaml"), "version: 1\ndefault_action: deny\n");
+    expect(() => ingestSource(vault, INPUT, { agent: "claude", now: NOW })).toThrow(
+      WriteRefusedError,
+    );
+    // Nothing was written: not the summary page, not the queue, not the
+    // entities, not the manifest.
+    expect(listEntities(vault, { category: "concept" })).toHaveLength(0);
+    expect(readManifestEntries()).toEqual([]);
+    expect(existsSync(join(vault, "Brain/pending/ingest"))).toBe(false);
+    const sourcesDir = join(vault, "Brain", "sources");
+    const summaryFiles = existsSync(sourcesDir)
+      ? fs.readdirSync(sourcesDir).filter((n) => n.endsWith(".md"))
+      : [];
+    expect(summaryFiles).toEqual([]);
+    // Exactly one ledger row, naming the default rule and the ingest action.
+    const rows = queryDecisionLedger(vault, { verdict: "deny" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      actor: "claude",
+      action: "ingest",
+      verdict: "deny",
+      source: "default",
+    });
+  });
+
+  test("an ask default stages the first publish and records exactly one row", () => {
+    seedSourceFile();
+    writeFileSync(join(vault, "Brain/_permissions.yaml"), "version: 1\ndefault_action: ask\n");
+    const res = ingestSource(vault, INPUT, { agent: "claude", now: NOW });
+    expect(res.staged).toBe(true);
+    const rows = queryDecisionLedger(vault, { verdict: "ask" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ action: "ingest", verdict: "ask", source: "default" });
   });
 });

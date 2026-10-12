@@ -45,6 +45,8 @@ import {
   WriteBatchError,
   type WriteOperation,
 } from "../../../src/core/brain/write-batch.ts";
+import { WriteRefusedError } from "../../../src/core/brain/pending/pending-lanes.ts";
+import { queryDecisionLedger } from "../../../src/core/brain/permissions/ledger.ts";
 import * as ledger from "../../../src/core/brain/idempotency-ledger.ts";
 import {
   IdempotencyKeyError,
@@ -57,6 +59,7 @@ import {
   pruneWriteImages,
 } from "../../../src/core/brain/notes/write-record.ts";
 import { writeImagePath } from "../../../src/core/brain/paths.ts";
+import { applyPendingLane } from "../../../src/core/brain/pending/pending-lanes.ts";
 import { sha256Hex } from "../../../src/core/integrity/digest.ts";
 import { CHMOD_CANNOT_DENY, IS_WINDOWS } from "../../helpers/platform.ts";
 
@@ -748,5 +751,159 @@ describe("applyWriteBatch request receipt integrity (t_b34439d9 audit)", () => {
         }),
       ).toThrow(WriteBatchError);
     }
+  });
+});
+
+/**
+ * The review gate (write-side trust, Task 9): a create op stages per-op
+ * under the notes lane's disposition while update and append ops stay
+ * direct. The kernel is untouched - a staged create never touches the
+ * real path, so validate-all-then-commit still projects every op against
+ * the same pre-batch state.
+ */
+describe("applyWriteBatch staged creates (review gate)", () => {
+  const NOTES_ENV = "OPEN_SECOND_BRAIN_WRITE_APPROVAL_NOTES_ENABLED";
+  let saved: string | undefined;
+
+  afterEach(() => {
+    if (saved === undefined) delete process.env[NOTES_ENV];
+    else process.env[NOTES_ENV] = saved;
+    saved = undefined;
+  });
+
+  function gateOn(): void {
+    saved = process.env[NOTES_ENV];
+    process.env[NOTES_ENV] = "true";
+  }
+
+  test("a create op stages and reports receipt status staged with the pending id", () => {
+    gateOn();
+    const res = applyWriteBatch(vault, [
+      { kind: "create_note", path: "Notes/Staged.md", content: "reviewed bytes" },
+    ]);
+    expect(res.applied).toBe(1);
+    const only = res.results[0]!;
+    expect(only).toMatchObject({
+      kind: "create_note",
+      path: "Notes/Staged.md",
+      created: false,
+      staged: true,
+    });
+    if (only.kind !== "create_note" || only.created !== false) throw new Error("unreachable");
+    const stagedPath = join(vault, "Brain/pending/notes", `${only.pending_id}.md`);
+    expect(readFileSync(stagedPath, "utf8")).toContain("reviewed bytes");
+    // Nothing exists at the publish target: the review boundary is entry.
+    expect(existsSync(join(vault, "Notes/Staged.md"))).toBe(false);
+  });
+
+  test("update and append ops against published notes stay direct under the gate", () => {
+    gateOn();
+    seedNote("Notes/Direct.md", "existing body");
+    const res = applyWriteBatch(vault, [
+      { kind: "create_note", path: "Notes/Staged.md", content: "staged" },
+      { kind: "append_note", path: "Notes/Direct.md", content: "appended text" },
+    ]);
+    const staged = res.results[0]!;
+    const appended = res.results[1]!;
+    expect(
+      staged.kind === "create_note" && staged.created === false && staged.staged === true,
+    ).toBe(true);
+    expect(appended.kind === "append_note" && appended.appended).toBe(true);
+    expect(readFileSync(join(vault, "Notes/Direct.md"), "utf8")).toContain("appended text");
+  });
+
+  test("an apply of the staged create publishes the exact bytes the batch staged", () => {
+    gateOn();
+    const res = applyWriteBatch(vault, [
+      {
+        kind: "create_note",
+        path: "Notes/Round.md",
+        frontmatter: { title: "Round" },
+        content: "round trip",
+      },
+    ]);
+    const only = res.results[0]!;
+    if (only.kind !== "create_note" || only.created !== false) throw new Error("unreachable");
+    const stagedBytes = readFileSync(
+      join(vault, "Brain/pending/notes", `${only.pending_id}.md`),
+      "utf8",
+    );
+    const applied = applyPendingLane(vault, only.pending_id);
+    expect(readFileSync(applied.path, "utf8")).toBe(stagedBytes);
+    expect(applied.path).toBe(join(vault, "Notes/Round.md"));
+  });
+
+  test("an occupied target refuses as exists even under the gate", () => {
+    gateOn();
+    seedNote("Notes/Taken.md", "already here");
+    expect(() =>
+      applyWriteBatch(vault, [{ kind: "create_note", path: "Notes/Taken.md", content: "x" }]),
+    ).toThrow(WriteBatchError);
+  });
+});
+
+describe("applyWriteBatch under a permissions document", () => {
+  const DOC = () => join(vault, "Brain", "_permissions.yaml");
+
+  function writeDoc(text: string): void {
+    mkdirSync(join(vault, "Brain"), { recursive: true });
+    writeFileSync(DOC(), text, "utf8");
+  }
+
+  test("a deny refuses an update of an admitted note, by name, before any byte", () => {
+    seedNote("Notes/Admitted.md", "original body");
+    writeDoc("version: 1\ndefault_action: deny\n");
+    let refused: WriteRefusedError | undefined;
+    try {
+      applyWriteBatch(vault, [
+        { kind: "update_note", path: "Notes/Admitted.md", body: "rewritten" },
+      ]);
+    } catch (err) {
+      refused = err instanceof WriteRefusedError ? err : undefined;
+    }
+    expect(refused).toBeInstanceOf(WriteRefusedError);
+    expect(refused?.action).toBe("write");
+    expect(refused?.target).toBe("Notes/Admitted.md");
+    expect(refused?.rule).toBe("default");
+    // Mutation is not a door around the rule: the note keeps its bytes,
+    // and exactly one deny row records the refusal.
+    expect(readFileSync(join(vault, "Notes/Admitted.md"), "utf8")).toContain("original body");
+    const rows = queryDecisionLedger(vault, { verdict: "deny" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ action: "write", target: "Notes/Admitted.md" });
+  });
+
+  test("a deny refuses an append the same way", () => {
+    seedNote("Notes/Appended.md", "first line");
+    writeDoc("version: 1\ndefault_action: deny\n");
+    expect(() =>
+      applyWriteBatch(vault, [{ kind: "append_note", path: "Notes/Appended.md", content: "more" }]),
+    ).toThrow(WriteRefusedError);
+    expect(readFileSync(join(vault, "Notes/Appended.md"), "utf8")).not.toContain("more");
+    expect(queryDecisionLedger(vault, { verdict: "deny" })).toHaveLength(1);
+  });
+
+  test("an ask mutates without staging and without a row", () => {
+    seedNote("Notes/Asked.md", "before");
+    writeDoc("version: 1\ndefault_action: ask\n");
+    const res = applyWriteBatch(vault, [
+      { kind: "update_note", path: "Notes/Asked.md", body: "after" },
+    ]);
+    expect(res.results[0]).toMatchObject({ kind: "update_note", updated: true });
+    expect(readFileSync(join(vault, "Notes/Asked.md"), "utf8")).toContain("after");
+    // The review boundary is ENTRY: a mutation never re-stages and the
+    // consult that ran is deny-only, so an ask leaves no ledger row.
+    expect(queryDecisionLedger(vault)).toEqual([]);
+  });
+
+  test("an allow mutates exactly as it did before the consult existed", () => {
+    seedNote("Notes/Allowed.md", "before");
+    writeDoc("version: 1\ndefault_action: allow\n");
+    const res = applyWriteBatch(vault, [
+      { kind: "append_note", path: "Notes/Allowed.md", content: "tail" },
+    ]);
+    expect(res.results[0]).toMatchObject({ kind: "append_note", appended: true });
+    expect(readFileSync(join(vault, "Notes/Allowed.md"), "utf8")).toContain("tail");
+    expect(queryDecisionLedger(vault)).toEqual([]);
   });
 });

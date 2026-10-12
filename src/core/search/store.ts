@@ -18,6 +18,8 @@
  */
 
 import { Database } from "bun:sqlite";
+import { statSync } from "node:fs";
+import { join } from "node:path";
 
 import { registerWriterDb, unregisterWriterDb } from "./store-exit.ts";
 
@@ -32,7 +34,9 @@ import {
 import { SearchError } from "./types.ts";
 import type { ResolvedSearchConfig } from "./types.ts";
 import type { EventAnchor } from "./event-anchor.ts";
-import { readSchemaVersion } from "./schema.ts";
+import { readSchemaVersion, type DocumentAttribute } from "./schema.ts";
+import { withoutAttributeNarrowing, type PropertyPushdown } from "./property-pushdown.ts";
+import { pathIsInside } from "../path-safety.ts";
 
 import * as aliases from "./store/aliases.ts";
 import * as chunkEntities from "./store/chunk-entities.ts";
@@ -115,6 +119,30 @@ export interface StoreOpenOptions {
   readonly mode: "read" | "write";
   /** When false, the vec extension is not auto-loaded (used by tests). */
   readonly loadVec?: boolean;
+}
+
+/**
+ * The freshness verdict the attribute-narrowing gate asks of every
+ * candidate it would otherwise exclude (answer-trust repair, M1): does the
+ * live file's stat fingerprint still match the one the index recorded?
+ *
+ * `documents.mtime` (unix seconds - the indexer's own floor of the file's
+ * mtime) and `documents.size` are the exact pair the indexer's fastpath
+ * already treats as "content unchanged" (`make`'s trade-off), so the gate
+ * reuses that definition instead of inventing a second one. The signature
+ * is the no-file-read pin: the whole liveness judgement is a comparison of
+ * two stat fingerprints, never a content read - the one file read a
+ * narrowed search pays stays the live post-rank filter's own, over the
+ * surfaced rows, exactly as before the gate existed. A candidate whose
+ * fingerprint matches is proven fresh and its SQL exclusion stands; any
+ * mismatch is STALE and the candidate falls through to the live filter,
+ * which owns the "judged live" contract (see {@link Store.gateAttributeNarrowing}).
+ */
+export function indexedSnapshotStale(
+  indexed: { readonly mtime: number; readonly size: number },
+  live: { readonly mtimeMs: number; readonly size: number },
+): boolean {
+  return Math.floor(live.mtimeMs / 1000) !== indexed.mtime || live.size !== indexed.size;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -343,6 +371,18 @@ export class Store {
   }
 
   /**
+   * The stored promoted-column verdicts of a candidate pool; see
+   * `documents.promotedColumnStates`. The post-rank promoted-key gate
+   * consumes this to arbitrate the rows the lanes' SQL admitted through a
+   * NULL column: judged live, never trusted from SQL.
+   */
+  promotedColumnStates(
+    documentIds: ReadonlyArray<number>,
+  ): Map<number, documents.PromotedColumnState> {
+    return documents.promotedColumnStates(this.db, documentIds);
+  }
+
+  /**
    * The materialised event anchor of one path (v11), or null when the
    * document is absent or declared no readable date. The query-side
    * event-time resolver consults this instead of re-scanning the note's
@@ -453,6 +493,16 @@ export class Store {
 
   hydrateChunks(chunkIds: ReadonlyArray<number>): Map<number, chunks.HydratedChunk> {
     return chunks.hydrateChunks(this.db, chunkIds);
+  }
+
+  /**
+   * Metadata-only pool hydration (recall-quality, C5): the pool's rows
+   * without `c.content` - content is hydrated for the ranked rows only,
+   * by {@link hydrateChunks}, inside the assembly. See
+   * `chunks.hydrateChunkRefs`.
+   */
+  hydrateChunkRefs(chunkIds: ReadonlyArray<number>): Map<number, chunks.HydratedChunk> {
+    return chunks.hydrateChunkRefs(this.db, chunkIds);
   }
 
   /**
@@ -567,11 +617,122 @@ export class Store {
     );
   }
 
+  /**
+   * The freshness gate on attribute narrowing (answer-trust repair, M1).
+   *
+   * `attributeNarrowingFragment` excludes a candidate when the attributes
+   * side table holds rows for a key and none of them is accepted - but
+   * those rows are a snapshot taken at index time, so the exclusion is
+   * only provable while the live file still matches it. The advertised
+   * contract is "narrow on the attribute snapshot, judged live"
+   * (`brain_search`'s `properties` schema), so a narrowed lane read is
+   * paired with a probe: the same lane read through
+   * {@link withoutAttributeNarrowing} (promoted predicates unchanged,
+   * narrowing lifted, same window). Candidates the probe surfaces and the
+   * narrowed read dropped are exactly the narrowing's exclusions; each
+   * gets one liveness check ({@link indexedSnapshotStale}) against the
+   * indexed stat fingerprint, and the stale ones are appended so the live
+   * post-rank filter - the arbiter - judges them. A fingerprint match
+   * proves the snapshot current, the SQL exclusion stands, and nothing is
+   * appended: the fresh path stays byte-identical to the ungated read.
+   *
+   * The gate's filesystem budget is one `statSync` per would-be-excluded
+   * candidate inside the lane window, bounded by the window itself; it
+   * never reads file contents. The `path` column is the index's own
+   * record, and it is trusted only as far as the vault it serves: a row
+   * whose path does not resolve inside the vault is never statted at all -
+   * the same lexical containment the live filter applies - and is ruled
+   * STALE by the shared rule below, which is the safe arm (the candidate
+   * falls through to the live filter and is judged by its unreadable-file
+   * semantics). An unstatable file cannot be proven
+   * current either, so its verdict is STALE by the same rule - that is a
+   * named arbitration, not a swallowed error: the live filter's
+   * unreadable-file semantics (`CachedFrontmatter.unreadable`, an empty
+   * frontmatter map that matches no accepted value) decide the row.
+   */
+  private gateAttributeNarrowing<
+    T extends { readonly documentId: number; readonly chunkId: number },
+  >(
+    hits: T[],
+    pushdown: PropertyPushdown | null | undefined,
+    probeLane: (probePushdown: PropertyPushdown | null) => T[],
+  ): T[] {
+    if (pushdown?.attributeNarrowing === undefined) return hits;
+    const probeHits = probeLane(withoutAttributeNarrowing(pushdown));
+    const keptChunks = new Set(hits.map((h) => h.chunkId));
+    const excluded = probeHits.filter((h) => !keptChunks.has(h.chunkId));
+    if (excluded.length === 0) return hits;
+    const keptDocs = new Set(hits.map((h) => h.documentId));
+    const excludedDocs = [...new Set(excluded.map((h) => h.documentId))].filter(
+      (id) => !keptDocs.has(id),
+    );
+    if (excludedDocs.length === 0) return hits;
+    const staleDocs = this.staleSnapshotDocumentIds(excludedDocs);
+    if (staleDocs.size === 0) return hits;
+    return [...hits, ...excluded.filter((h) => staleDocs.has(h.documentId))];
+  }
+
+  /**
+   * The stale half of the given documents, judged by
+   * {@link indexedSnapshotStale}: one indexed-fingerprint row per document
+   * (never a chunk body) and one `statSync` per document - stat metadata
+   * only, never a content read. A document whose row is missing yields no
+   * verdict and no rescue, which is the narrowed read's own answer.
+   */
+  private staleSnapshotDocumentIds(documentIds: ReadonlyArray<number>): Set<number> {
+    const placeholders = documentIds.map(() => "?").join(", ");
+    const rows = this.db
+      .query<{ id: number; path: string; mtime: number; size: number }, number[]>(
+        `SELECT id, path, mtime, size FROM documents WHERE id IN (${placeholders})`,
+      )
+      .all(...documentIds);
+    const stale = new Set<number>();
+    for (const row of rows) {
+      // The index's path column is not trusted past the vault it serves: a
+      // row whose path escapes the vault is not a file this gate may stat,
+      // so it is ruled stale without touching the filesystem - the same
+      // lexical containment the live filter applies, and the safe arm (the
+      // candidate falls through to the live filter, which judges it
+      // unreadable rather than reading outside the vault).
+      if (!pathIsInside(join(this.config.vault, row.path), this.config.vault)) {
+        stale.add(row.id);
+        continue;
+      }
+      let liveSize: number;
+      let liveMtimeMs: number;
+      try {
+        const live = statSync(join(this.config.vault, row.path));
+        liveSize = live.size;
+        liveMtimeMs = live.mtimeMs;
+      } catch {
+        // Unstatable: the snapshot cannot be proven current. Named
+        // arbitration (see {@link gateAttributeNarrowing}), never silent.
+        stale.add(row.id);
+        continue;
+      }
+      if (
+        indexedSnapshotStale(
+          { mtime: row.mtime, size: row.size },
+          { mtimeMs: liveMtimeMs, size: liveSize },
+        )
+      ) {
+        stale.add(row.id);
+      }
+    }
+    return stale;
+  }
+
   semanticTopK(
     queryVector: ReadonlyArray<number> | Float32Array,
-    opts: { readonly limit: number; readonly pathPrefix?: string | null },
+    opts: vectors.SemanticTopKOptions,
   ): vectors.SemanticHit[] {
-    return vectors.semanticTopK(this.db, this.vecExtensionLoaded, queryVector, opts);
+    const hits = vectors.semanticTopK(this.db, this.vecExtensionLoaded, queryVector, opts);
+    return this.gateAttributeNarrowing(hits, opts.pushdown, (probe) =>
+      vectors.semanticTopK(this.db, this.vecExtensionLoaded, queryVector, {
+        ...opts,
+        pushdown: probe,
+      }),
+    );
   }
 
   // ── links ──────────────────────────────────────────────────────────────────
@@ -655,6 +816,18 @@ export class Store {
   /** Normalised aliases of one document, sorted. */
   aliasesForDocument(documentId: number): ReadonlyArray<string> {
     return aliases.aliasesForDocument(this.db, documentId);
+  }
+
+  // ── document attributes (v14, recall-quality) ───────────────────────────────
+
+  /**
+   * Replace one document's stored frontmatter attributes wholesale. The
+   * caller derives the bounded, promoted-key-free rows with
+   * `documentAttributesFromFrontmatter` (schema.ts) from the same parsed
+   * frontmatter that fed the upsert's other columns.
+   */
+  replaceDocumentAttributes(documentId: number, attrs: ReadonlyArray<DocumentAttribute>): void {
+    documents.replaceDocumentAttributes(this.db, documentId, attrs);
   }
 
   /**
@@ -796,13 +969,14 @@ export class Store {
 
   /**
    * Top-K BM25 keyword hits. `fts5Query` is an already-escaped FTS5
-   * MATCH expression; building it is fts.ts's job.
+   * MATCH expression; building it is fts.ts's job. A narrowed pushdown
+   * rides the freshness gate ({@link gateAttributeNarrowing}).
    */
-  keywordTopK(
-    fts5Query: string,
-    opts: { readonly limit: number; readonly pathPrefix?: string | null },
-  ): keyword.KeywordHit[] {
-    return keyword.keywordTopK(this.db, fts5Query, opts);
+  keywordTopK(fts5Query: string, opts: keyword.KeywordTopKOptions): keyword.KeywordHit[] {
+    const hits = keyword.keywordTopK(this.db, fts5Query, opts);
+    return this.gateAttributeNarrowing(hits, opts.pushdown, (probe) =>
+      keyword.keywordTopK(this.db, fts5Query, { ...opts, pushdown: probe }),
+    );
   }
 
   /**
@@ -814,9 +988,22 @@ export class Store {
    */
   trigramCandidates(
     trigramQuery: string,
-    opts: { readonly limit: number; readonly pathPrefix?: string | null },
+    opts: {
+      readonly limit: number;
+      readonly pathPrefix?: string | null;
+      readonly kind?: "page" | "section" | null;
+      readonly pushdown?: PropertyPushdown | null;
+    },
   ): trigram.TrigramCandidateOutcome {
-    return trigram.trigramCandidates(this.db, trigramQuery, opts);
+    const outcome = trigram.trigramCandidates(this.db, trigramQuery, opts);
+    const hits = this.gateAttributeNarrowing(
+      outcome.hits,
+      opts.pushdown ?? null,
+      (probe) =>
+        trigram.trigramCandidates(this.db, trigramQuery, { ...opts, pushdown: probe }).hits,
+    );
+    if (hits === outcome.hits) return outcome;
+    return { ...outcome, hits };
   }
 
   // ── entities ─────────────────────────────────────────────────────────────

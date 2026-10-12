@@ -82,6 +82,9 @@ const READ_MODEL_READERS: Readonly<Record<string, string>> = Object.freeze({
 const DIRECT_STORE_READERS: Readonly<Record<string, string>> = Object.freeze({
   "src/core/brain/context-pack-evidence.ts":
     "reads `context_pack_evidence` for the kernel-recomputed evidence ledger.",
+  "src/core/brain/dead-weight.ts":
+    "reads `recall_telemetry` and `recall_observed_use` for the never-surfaced " +
+    "complement the two recorded sets fold against.",
   "src/core/brain/context-pack-outcome.ts": "reads `context_pack_outcome` for the outcome ledger.",
   "src/core/brain/context-receipts.ts": "reads `context_receipt` for list, summary and show.",
   "src/core/brain/dedup-telemetry.ts":
@@ -94,8 +97,18 @@ const DIRECT_STORE_READERS: Readonly<Record<string, string>> = Object.freeze({
   "src/core/brain/doctor/orphan-session-check.ts":
     "reads the WHOLE store to collect every known session id, so a " +
     "session_ref resolves against the same universe the writers stamp.",
+  "src/core/brain/doctor/session-identity-check.ts":
+    "reads the WHOLE store once to count the records per kind that name no " +
+    "session; count-only, so a partial read would dress a store gap up as a " +
+    "finding and an unreadable ledger costs an uncertainty instead.",
   "src/core/brain/link-graph/repair-lane.ts":
     "reads the WHOLE store to harvest `sourceRefs` paths for link repair.",
+  "src/core/brain/link-graph/session-mining.ts":
+    "reads `session_entity_mention` to seed a re-import's dedupe set, so a " +
+    "repeated transcript cannot re-mint its rows.",
+  "src/core/brain/link-graph/hallways.ts":
+    "reads `session_entity_mention` for the mined-mention ledger the hallways " +
+    "fold turns into incidence and pairwise PMI.",
   "src/core/brain/mcp-route-metrics.ts": "reads `mcp_route_latency` for per-route rollups.",
   "src/core/brain/memory-cost-meter.ts": "reads `host_memory_write` for the write-vs-read ratio.",
   "src/core/brain/observed-use.ts": "reads `recall_observed_use` for observed-use aggregation.",
@@ -142,7 +155,10 @@ const DIRECT_STORE_READERS: Readonly<Record<string, string>> = Object.freeze({
  * nothing extra to keep true.
  */
 const READ_MODEL_READER_COUNT = 4;
-const DIRECT_STORE_READER_COUNT = 23;
+// 26 -> 27: the answer-trust wave registers the blank-session-identity
+// doctor check (`doctor/session-identity-check.ts`), which reads the whole
+// store once to count records per kind that name no session.
+const DIRECT_STORE_READER_COUNT = 27;
 
 /** A file the classifier must see, and that `grep` alone does not. */
 

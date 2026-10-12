@@ -74,6 +74,11 @@ const UNGUARDED_WITH_REASON: Readonly<Record<string, string>> = Object.freeze({
     "never writes. It names `openSync` only to open a source read-only " +
     "(O_RDONLY | O_NOFOLLOW | O_NONBLOCK) through one descriptor so the read " +
     "is bounded, so there is no write to guard.",
+  "src/core/brain/intake/extract-intake.ts":
+    "its one direct removal is the stage arm's unlink of a canonical entity " +
+    "page the same intake call created through the guarded registry; the " +
+    "staged copy lands through the review queue's guarded writer, and every " +
+    "persistent write the module makes routes through those guarded writers.",
   "src/core/brain/init.ts":
     "bootstrap. This is the path that CREATES the tree and stamps the marker; " +
     "gating it on the marker it is about to write would refuse `o2b brain init` " +
@@ -100,9 +105,20 @@ const UNGUARDED_WITH_REASON: Readonly<Record<string, string>> = Object.freeze({
   "src/core/brain/portability/recall-sources.ts":
     "machine-local recall-source registry under the config directory, not " +
     "vault content. Keyed by `configPath`; no vault is in scope.",
+  "src/core/brain/provenance/source-archive.ts":
+    "every path it writes or removes is derived inside this module from the " +
+    "entry's own sha-256 and validated before the join, so the store cannot be " +
+    "aimed anywhere but `Brain/.archives/`; its two vault-reaching callers (the " +
+    "ingest trusted branch and the confirmed delete-by-source) assert vault " +
+    "identity ahead of the first byte and ahead of the removal.",
   "src/core/brain/secrets/crypto.ts":
     "takes a keyfile path, not a vault. The three public entry points in " +
     "`secrets/store.ts` that reach it are guarded ahead of their first byte.",
+  "src/core/brain/secrets/envelope.ts":
+    "takes a keyfile path, not a vault, like its sibling `crypto.ts`. The " +
+    "vault-level entry points in `secrets/store.ts` that reach it (the " +
+    "wrap-on-first-unlock and the lock) are guarded ahead of their first " +
+    "byte, and the holder lookups write nothing at all.",
   "src/core/brain/sync-lockfile.ts":
     "lock primitive over a caller-supplied path; the writers that acquire it " +
     "are guarded at their own entry points.",

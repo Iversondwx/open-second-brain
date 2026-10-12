@@ -5,6 +5,8 @@ import { join } from "node:path";
 
 import { JSONRPC_VERSION, MCPServer, PROTOCOL_VERSION } from "../../src/mcp/index.ts";
 import { buildToolTable } from "../../src/mcp/tools.ts";
+import { appendSessionSummary } from "../../src/core/brain/session-summary.ts";
+import { appendContinuityRecord } from "../../src/core/brain/continuity/store.ts";
 
 let vault: string;
 
@@ -84,6 +86,82 @@ describe("brain_session_summary tool", () => {
     const got = payload(await call({ operation: "get", session_id: "missing" }));
     expect(got["found"]).toBe(false);
     expect(got["digest"]).toBeUndefined();
+  });
+
+  test("found:false is byte-identical (no divergence keys on the miss)", async () => {
+    const response = await call({ operation: "get", session_id: "missing" });
+    const result = response.result as { content: ReadonlyArray<{ type: string; text: string }> };
+    // The wire text is the structured payload serialized with indent 2;
+    // byte-identity means exactly this string and nothing else.
+    expect(result.content[0]!.text).toBe(JSON.stringify({ found: false }, null, 2));
+  });
+
+  test("get after sequential revisions stays quiet (revisions, not divergence)", async () => {
+    // Two differing writes at distinct instants are a revision stream - the
+    // later digest wins deterministically - not a conflict (v1.78.0 review
+    // round). The instants are seeded explicitly because the tool's write
+    // path stamps its own clock, and two rapid writes can land inside one
+    // millisecond, which is the divergent shape the next test pins.
+    appendSessionSummary(vault, {
+      sessionId: "dv",
+      decisions: ["first take"],
+      createdAt: "2026-06-14T09:00:00.000Z",
+    });
+    appendSessionSummary(vault, {
+      sessionId: "dv",
+      decisions: ["second take"],
+      createdAt: "2026-06-14T11:00:00.000Z",
+    });
+
+    const got = payload(await call({ operation: "get", session_id: "dv" }));
+    expect(got["found"]).toBe(true);
+    expect(got["digest_count"]).toBe(2);
+    expect("divergent" in got).toBe(false);
+    expect("records" in got).toBe(false);
+    const digest = got["digest"] as Record<string, unknown>;
+    expect(digest["decisions"]).toEqual(["second take"]);
+  });
+
+  test("get for distinct contents meeting at one instant carries the divergence keys", async () => {
+    // The tool's write path stamps its own (necessarily distinct) instants,
+    // so the divergent shape - distinct contents at one created_at instant,
+    // the one shape the store cannot order - is seeded with an explicit
+    // shared timestamp.
+    appendSessionSummary(vault, {
+      sessionId: "dv2",
+      decisions: ["device a take"],
+      createdAt: "2026-06-14T10:00:00.000Z",
+    });
+    appendSessionSummary(vault, {
+      sessionId: "dv2",
+      decisions: ["device b take"],
+      createdAt: "2026-06-14T10:00:00.000Z",
+    });
+
+    const got = payload(await call({ operation: "get", session_id: "dv2" }));
+    expect(got["found"]).toBe(true);
+    expect(got["digest_count"]).toBe(2);
+    expect(got["divergent"]).toBe(true);
+    const records = got["records"] as Array<Record<string, unknown>>;
+    expect(records.length).toBe(2);
+    for (const record of records) {
+      expect(typeof record["id"]).toBe("string");
+      expect(typeof record["created_at"]).toBe("string");
+      expect(typeof record["content_hash"]).toBe("string");
+    }
+    // id/hash lists, never full payload echoes.
+    expect(JSON.stringify(records)).not.toContain("device b take");
+    const digest = got["digest"] as Record<string, unknown>;
+    expect(digest["decisions"]).toEqual(["device b take"]);
+  });
+
+  test("a single-record get adds digest_count and no divergence keys", async () => {
+    await call({ operation: "write", session_id: "solo", decisions: ["only take"] });
+    const got = payload(await call({ operation: "get", session_id: "solo" }));
+    expect(got["found"]).toBe(true);
+    expect(got["digest_count"]).toBe(1);
+    expect("divergent" in got).toBe(false);
+    expect("records" in got).toBe(false);
   });
 
   test("write with no categories is an invalid-params error", async () => {
@@ -168,5 +246,22 @@ describe("brain_session_summary project scope (Task 18)", () => {
     const tool = buildToolTable("full").find((entry) => entry.name === "brain_session_summary");
     const properties = (tool!.inputSchema as { properties: Record<string, unknown> }).properties;
     expect(properties["project_scope"]).toBeDefined();
+  });
+
+  test("list renders a no-session digest without a fabricated session_id", async () => {
+    // Seeded directly, the way a writer that stamps `session_id`
+    // conditionally leaves the key absent.
+    appendContinuityRecord(vault, {
+      kind: "session_summary_digest",
+      createdAt: "2026-06-14T10:00:00.000Z",
+      sourceRefs: [{ id: "s-none", kind: "session" }],
+      payload: { decisions: ["unattributed"], content_hash: "0123456789abcdef" },
+    });
+
+    const listed = payload(await call({ operation: "list" }));
+    expect(listed["count"]).toBe(1);
+    const digest = (listed["digests"] as Array<Record<string, unknown>>)[0]!;
+    expect("session_id" in digest).toBe(false);
+    expect(digest["decisions"]).toEqual(["unattributed"]);
   });
 });

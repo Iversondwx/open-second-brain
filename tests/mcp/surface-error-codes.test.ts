@@ -430,7 +430,7 @@ describe("every operation-dispatching tool answers unknown_operation", () => {
     [
       "brain_recall_telemetry",
       { operation: BOGUS },
-      "brain_recall_telemetry: operation must be list, summary, gate_list, gate_summary, observed_reuse, or cost",
+      "brain_recall_telemetry: operation must be list, summary, gate_list, gate_summary, observed_reuse, cost, or dead_weight",
     ],
     [
       "brain_route_metrics",
@@ -495,7 +495,7 @@ describe("every operation-dispatching tool answers unknown_operation", () => {
     [
       "brain_decision",
       { action: BOGUS },
-      "brain_decision: 'action' must be one of record, outcome, rate, show, list, compare, similar, history, recall",
+      "brain_decision: 'action' must be one of record, outcome, rate, show, list, compare, similar, history, recall, open, list_open, show_open, resolve, discard",
     ],
     [
       "brain_lifecycle",

@@ -116,6 +116,24 @@ export const BRAIN_ARTIFACTS_DIR = ".artifacts";
 export const BRAIN_ARTIFACTS_REL = posix.join(BRAIN_ROOT_REL, BRAIN_ARTIFACTS_DIR);
 
 /**
+ * Durable raw-source archive (answer trust): `Brain/.archives/<sha256>.txt`.
+ * The ingest trusted-local branch persists the bytes a summary page's
+ * knowledge was read from - redacted, content-addressed - so a source whose
+ * file later decays can still be re-verified against what the page claimed.
+ *
+ * Dot-directory so the vault walker excludes it from search/indexing exactly
+ * like `.snapshots` and `.artifacts`, and the index-admission predicate
+ * refuses it by name besides (its entries are `.txt`, which the `.md` walkers
+ * already skip - the stated rule keeps that from being an accident of the
+ * extension). Deliberately NOT in {@link BRAIN_SNAPSHOT_EXCLUDED_ENTRIES},
+ * unlike `.artifacts`: this is evidence rather than scratch, so a restore
+ * must bring the bytes back - the same reading that keeps `.payloads` in the
+ * snapshots. There is no TTL; retention is explicit operator pruning.
+ */
+export const BRAIN_ARCHIVES_DIR = ".archives";
+export const BRAIN_ARCHIVES_REL = posix.join(BRAIN_ROOT_REL, BRAIN_ARCHIVES_DIR);
+
+/**
  * Externalized oversized session content (payload registry, t_35440e83):
  * `Brain/.payloads/<sha256>.txt`. Session import moves data URIs, long
  * base64 runs and over-threshold turn text here and leaves a
@@ -190,6 +208,18 @@ export const DERIVED_STORE_FILE = "brain.sqlite";
  * done.
  */
 export const HOOK_AUDIT_DIR = "hook-audit";
+
+/**
+ * The extension every JSON Lines ledger writes, without the leading dot.
+ *
+ * Declared in this leaf rather than in `ledger-shards.ts` (which re-exports
+ * it, so no importer changes) because the audit writer's week-grammar
+ * constant reads it at module-evaluation time, and `ledger-shards.ts`
+ * reaches back into `config.ts` for the device id - a cycle that TDZ-aborted
+ * `audit.ts` whenever the shard grammar module was entered first. A name
+ * this many ledgers share belongs beside the other Brain file names anyway.
+ */
+export const JSONL_LEDGER_EXT = "jsonl";
 
 /** Brain-internal artefact filenames at the root of `Brain/`. */
 export const BRAIN_CONFIG_FILE = "_brain.yaml";

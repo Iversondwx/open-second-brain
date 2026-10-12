@@ -58,6 +58,7 @@ import {
   cmdBrainClusters,
   cmdBrainVitals,
   cmdBrainCoOccurrence,
+  cmdBrainHallways,
   cmdBrainFileContext,
   cmdBrainBenchmark,
   cmdBrainTune,
@@ -162,6 +163,7 @@ import {
   cmdBrainStale,
   cmdBrainDaily,
   cmdBrainWeekly,
+  cmdBrainPermissions,
 } from "./brain/verbs/index.ts";
 
 /**
@@ -323,6 +325,8 @@ export async function handleBrainSubcommand(argv: ReadonlyArray<string>): Promis
         return await cmdBrainVitals(rest);
       case "co-occurrence":
         return await cmdBrainCoOccurrence(rest);
+      case "hallways":
+        return await cmdBrainHallways(rest);
       case "file-context":
         return await cmdBrainFileContext(rest);
       case "benchmark":
@@ -527,6 +531,8 @@ export async function handleBrainSubcommand(argv: ReadonlyArray<string>): Promis
         return await cmdBrainDaily(rest);
       case "weekly":
         return await cmdBrainWeekly(rest);
+      case "permissions":
+        return await cmdBrainPermissions(rest);
       default:
         process.stderr.write(`error: unknown brain verb: ${verb}\n`);
         process.stdout.write(BRAIN_HELP);

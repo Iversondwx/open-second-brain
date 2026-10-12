@@ -34,9 +34,13 @@ import {
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { noteWriteResult, parseFrontmatterArg, writeBatchErrorToMcp } from "./notes-tools.ts";
+import { refuseAgentClaim } from "./agent-claim.ts";
 import { readableAtContextReach } from "./reach-readable.ts";
 import { vaultRelativeSafe } from "./shared.ts";
 import { unknownOperationError } from "../coerce.ts";
+import { PENDING_STAGED_DIAGNOSTIC_CODE } from "../../core/brain/pending/pending-lanes.ts";
+import { nextCommandField } from "../../core/brain/next-step.ts";
+import { WRITE_PATH_ADVISORY_KEY } from "../../core/brain/write-path-advisory.ts";
 
 /** Recognised batch operation discriminators. */
 const OP_KINDS = [
@@ -157,7 +161,10 @@ function mapOperation(
 
 /**
  * Serialize one core op result, mapping absolute log paths to
- * vault-relative form so the response never leaks the machine root.
+ * vault-relative form so the response never leaks the machine root. A
+ * STAGED create (review gate on) carries its pending id and the queue
+ * command that publishes it, so an agent sees the review boundary
+ * rather than reading `created: false` as a refusal.
  */
 function serializeResult(
   ctx: ServerContext,
@@ -168,6 +175,19 @@ function serializeResult(
       kind: result.kind,
       logged_at: result.logged_at,
       log_path: vaultRelativeSafe(ctx.vault, result.log_path),
+    };
+  }
+  if (result.kind === "create_note" && result.created === false) {
+    return {
+      kind: result.kind,
+      path: result.path,
+      created: false,
+      staged: true,
+      pending_id: result.pending_id,
+      ...(result[WRITE_PATH_ADVISORY_KEY] !== undefined
+        ? { [WRITE_PATH_ADVISORY_KEY]: result[WRITE_PATH_ADVISORY_KEY] }
+        : {}),
+      ...nextCommandField(PENDING_STAGED_DIAGNOSTIC_CODE),
     };
   }
   return { ...result };
@@ -217,16 +237,30 @@ async function toolBrainWriteBatch(
   if (!Array.isArray(rawOps)) {
     throw new MCPError(INVALID_PARAMS, "brain_write_batch: 'operations' must be an array");
   }
-  const resolveAgent = (override?: string): string =>
-    normalizeAgentArgument(override ?? null) ?? resolveAgentName(ctx.configPath ?? undefined);
+  // The log-writing ops stamp their agent attribution from the caller's
+  // override, then the config. A token caller claims neither: the
+  // mismatch is refused, and the identity fills the absent override
+  // (write-side-trust, Task 7).
+  const resolveAgent = (override?: string): string => {
+    refuseAgentClaim(ctx.requestIdentity, override ?? null, "brain_write_batch");
+    return (
+      normalizeAgentArgument(override ?? null) ??
+      ctx.requestIdentity?.agent ??
+      resolveAgentName(ctx.configPath ?? undefined)
+    );
+  };
   const operations = rawOps.map((raw, index) => mapOperation(raw, index, resolveAgent));
   const requestId = optionalStr(args, "request_id");
 
   // An update or append whose target the caller may not read at its
-  // reach is refused exactly as a missing one.
+  // reach is refused exactly as a missing one. The transport-minted
+  // identity rides as the batch's subject (write-side-trust, Task 7),
+  // covering the owner gate and the deny-only document consult on the
+  // update and append ops.
   const baseOpts = {
     readable: readableAtContextReach(ctx),
     ...(ctx.configPath !== null ? { configPath: ctx.configPath } : {}),
+    ...(ctx.requestIdentity !== undefined ? { subject: ctx.requestIdentity } : {}),
   };
   let batch: WriteBatchResult;
   // Set exactly when a request ID was supplied: the core's receipted

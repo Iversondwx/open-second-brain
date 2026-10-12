@@ -14,6 +14,9 @@ import { loadTunedParameters, resetTuning } from "../../core/search/tuning-store
 import { listGateTelemetry, summarizeGateTelemetry } from "../../core/brain/gate-telemetry.ts";
 import { computeMemoryCostMeter } from "../../core/brain/memory-cost-meter.ts";
 import { observedReuseRates } from "../../core/brain/observed-use.ts";
+import { computeDeadWeight, DEAD_WEIGHT_MAX_LIMIT } from "../../core/brain/dead-weight.ts";
+import { everyArtifactRefView } from "../../core/brain/artifact-ref-view.ts";
+import { gatedOwnerScopeView } from "../../core/brain/owner-scope-view.ts";
 import {
   isRecallChannel,
   isRecallTelemetryMode,
@@ -82,6 +85,7 @@ import {
 import { TRANSPORT_REACH } from "../../core/graph/transport-reach.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
 import { contextReach } from "../tool-contract.ts";
+import { requestRefView } from "./reach-events.ts";
 import type { ServerContext, ToolDefinition } from "../tool-contract.ts";
 import { vaultPathField } from "../vault-path-field.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
@@ -294,8 +298,47 @@ async function toolBrainRecallTelemetry(
     });
     return { vault_path: vaultPathField(ctx), ...meter };
   }
+  // Dead weight (recall-quality, t_1ee67e5b): the complement fold over
+  // the vault's live in-scope pages and every path recorded recall ever
+  // surfaced (telemetry top artifacts + observed-use source refs). The
+  // seventh operation on this tool - an operation, never a new tool, so
+  // the tool-count pin does not move.
+  if (operation === "dead_weight") {
+    // Record-only filters (mode/status/channel/host) have no meaning for
+    // the complement; reject them rather than silently ignore, mirroring
+    // the cost op and the CLI's fail-closed verb. `limit` is the one
+    // exception (PR #248 review L10): it bounds the dead preview, which
+    // is otherwise pinned at the fold's 50-row default, clamped to the
+    // shared maximum so the full list is reachable in bounded pages.
+    for (const name of ["mode", "status", "channel", "host"] as const) {
+      if (args[name] !== undefined) {
+        throw new MCPError(
+          INVALID_PARAMS,
+          `brain_recall_telemetry: ${name} is not supported for dead_weight`,
+        );
+      }
+    }
+    // Hidden rows are dropped BEFORE total: the request's reach/ownership
+    // boundary is applied to the FULL SET, so `pages_total`, `dead` and
+    // every count answer only what this caller may see - a total that
+    // still included the hidden rows would leak their number (the
+    // analytics rule). A local caller filters nothing, by construction.
+    const refs = everyArtifactRefView(
+      requestRefView(ctx),
+      gatedOwnerScopeView(ctx.vault, ctx.agentName),
+    );
+    const report = computeDeadWeight(ctx.vault, {
+      ...(filter.since !== undefined ? { since: filter.since } : {}),
+      ...(filter.until !== undefined ? { until: filter.until } : {}),
+      ...(filter.limit !== undefined
+        ? { deadLimit: Math.min(filter.limit, DEAD_WEIGHT_MAX_LIMIT) }
+        : {}),
+      ...(refs.filtersNothing ? {} : { includePath: (rel: string) => refs.visible(rel) }),
+    });
+    return { vault_path: vaultPathField(ctx), ...report };
+  }
   throw unknownOperationError(
-    "brain_recall_telemetry: operation must be list, summary, gate_list, gate_summary, observed_reuse, or cost",
+    "brain_recall_telemetry: operation must be list, summary, gate_list, gate_summary, observed_reuse, cost, or dead_weight",
   );
 }
 
@@ -1108,15 +1151,23 @@ export const RECALL_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
     name: "brain_recall_telemetry",
     previewBudget: MCP_PREVIEW_BUDGET,
     description:
-      "List recall telemetry records or summarize recall coverage and gaps; cost folds write volume (feedback/apply-evidence/note/host writes) against reads into a write-vs-read ratio, a write-heavy flag, and a rough cost signal per period. Emitted only by opt-in callers. Read-only.",
+      "List recall telemetry records or summarize recall coverage and gaps; cost folds write volume against reads per period; dead_weight reports in-scope pages no recall ever surfaced, hidden pages dropped before totals, dead list capped (limit; default 50, max 500). Opt-in emit; read-only.",
     inputSchema: {
       type: "object",
       properties: {
         operation: {
           type: "string",
-          enum: ["list", "summary", "gate_list", "gate_summary", "observed_reuse", "cost"],
+          enum: [
+            "list",
+            "summary",
+            "gate_list",
+            "gate_summary",
+            "observed_reuse",
+            "cost",
+            "dead_weight",
+          ],
           description:
-            "list/summary for recall telemetry; gate_list/gate_summary for gate decisions; observed_reuse for the observed-use ranking signal; cost for the cost meter.",
+            "list/summary telemetry; gate_list/gate_summary gate decisions; observed_reuse use ranking; cost the cost meter; dead_weight the never-surfaced view.",
         },
         mode: {
           type: "string",
@@ -1148,7 +1199,8 @@ export const RECALL_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
         limit: {
           type: "integer",
           minimum: 1,
-          description: "Optional maximum record count for list.",
+          description:
+            "Optional maximum record count for list; dead_weight: the dead preview cap (default 50, max 500).",
         },
         write_cost: {
           type: "number",

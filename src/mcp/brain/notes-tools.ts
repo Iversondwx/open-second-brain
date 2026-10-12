@@ -43,6 +43,11 @@ import {
 import type { ReadableRef } from "../../core/brain/near-duplicate.ts";
 import { nextCommandField } from "../../core/brain/next-step.ts";
 import {
+  PENDING_STAGED_DIAGNOSTIC_CODE,
+  PendingStageConflictError,
+  WriteRefusedError,
+} from "../../core/brain/pending/pending-lanes.ts";
+import {
   lintWrittenPages,
   pageLintField,
   type LintWrittenPagesOptions,
@@ -230,6 +235,28 @@ export function writeBatchErrorToMcp(err: unknown, tool: string): MCPError {
       ...err.details,
     });
   }
+  // Write-side trust (Task 12): a permissions document rule denied one of
+  // the batch's ops. Named code, the rule that decided, and the operator
+  // exit - the batch aborted before any commit, so the refusal is the
+  // whole answer.
+  if (err instanceof WriteRefusedError) {
+    return new MCPError(INVALID_PARAMS, `${tool}: ${err.message}`, {
+      code: err.code,
+      rule: err.rule,
+      agent: err.agent,
+      next_command: err.nextCommand,
+    });
+  }
+  // A staged op retried while its first run is still pending: the queue
+  // refuses by name, so the answer names the queue entry holding the
+  // target instead of an internal error a caller would retry into.
+  if (err instanceof PendingStageConflictError) {
+    return new MCPError(INVALID_PARAMS, `${tool}: ${err.message}`, {
+      code: err.code,
+      existing_id: err.existingId,
+      target: err.target,
+    });
+  }
   return new MCPError(INTERNAL_ERROR, err instanceof Error ? err.message : String(err));
 }
 
@@ -282,11 +309,28 @@ async function toolBrainCreateNote(
       // is the one THIS config declares - not the one a machine-default
       // discovery would find (who-wrote-what, Task A).
       ...(ctx.configPath !== null ? { configPath: ctx.configPath } : {}),
+      // The transport-minted identity wins as the permission subject and
+      // the owner gate's resolved identity (write-side-trust, Task 7): a
+      // token's create answers for the token's agent.
+      ...(ctx.requestIdentity !== undefined ? { subject: ctx.requestIdentity } : {}),
     });
     // `outcome` is the discriminant; `created` is the boolean this tool
     // has always returned and stays in lockstep with it, so a skip can
     // never be read as a create by either field. A skip authored no
-    // bytes, so it names no page for the lint.
+    // bytes, so it names no page for the lint. A STAGED create (review
+    // gate on) also authored nothing at the target: its receipt carries
+    // the pending id and the queue command that publishes it, and names
+    // no page for the lint because nothing was published.
+    if (res.outcome === "staged") {
+      return await noteWriteResult(ctx, [], {
+        created: false,
+        outcome: "staged",
+        staged: true,
+        path: res.path,
+        pending_id: res.pendingId,
+        ...nextCommandField(PENDING_STAGED_DIAGNOSTIC_CODE),
+      });
+    }
     return await noteWriteResult(ctx, res.created ? [res.path] : [], {
       created: res.created,
       outcome: res.outcome,
@@ -311,6 +355,26 @@ async function toolBrainCreateNote(
         code: err.code,
         ...advisoryFields(err.code),
         ...(err.violations.length > 0 ? { violations: err.violations } : {}),
+      });
+    }
+    // Write-side trust (Task 12): a permissions document rule denied the
+    // create. Named code, the rule that decided, and the operator exit.
+    if (err instanceof WriteRefusedError) {
+      throw new MCPError(INVALID_PARAMS, `brain_create_note: ${err.message}`, {
+        code: err.code,
+        rule: err.rule,
+        agent: err.agent,
+        next_command: err.nextCommand,
+      });
+    }
+    // A create retried while its first run is still staged: the queue
+    // refuses by name, so the answer names the queue entry holding the
+    // target instead of an internal error a caller would retry into.
+    if (err instanceof PendingStageConflictError) {
+      throw new MCPError(INVALID_PARAMS, `brain_create_note: ${err.message}`, {
+        code: err.code,
+        existing_id: err.existingId,
+        target: err.target,
       });
     }
     rethrowVaultFrozen(err);
@@ -458,10 +522,14 @@ function runSingleWrite<K extends SingleNoteOperation["kind"]>(
   let batch;
   try {
     // A target the caller may not read at its reach is refused exactly
-    // as a missing one.
+    // as a missing one. The transport-minted identity rides along as the
+    // batch's subject (write-side-trust, Task 7): a token's update or
+    // append answers for the token's agent, in the owner gate and the
+    // deny-only document consult alike.
     batch = applyWriteBatch(ctx.vault, [op], {
       readable: readableAtContextReach(ctx),
       ...(ctx.configPath !== null ? { configPath: ctx.configPath } : {}),
+      ...(ctx.requestIdentity !== undefined ? { subject: ctx.requestIdentity } : {}),
     });
   } catch (err) {
     throw writeBatchErrorToMcp(err, tool);

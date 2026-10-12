@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { bootstrapBrain } from "../../../../src/core/brain/init.ts";
 import { atomicWriteFileSync } from "../../../../src/core/fs-atomic.ts";
 import { ingestSource } from "../../../../src/core/brain/ingest/ingest.ts";
+import { computeExtractionContractFingerprint } from "../../../../src/core/brain/ingest/contract.ts";
 import {
   classifyPaths,
   hashFile,
@@ -23,6 +24,8 @@ import {
   updateManifest,
   writeManifestAtomic,
 } from "../../../../src/core/brain/ingest/content-manifest.ts";
+import { planBatches } from "../../../../src/core/brain/ingest/batch-plan.ts";
+import { deleteBySource } from "../../../../src/core/brain/source-cleanup.ts";
 
 let vault: string;
 let configHome: string;
@@ -137,7 +140,7 @@ describe("manifest persistence", () => {
   test("updateManifest drops entries whose file was deleted", () => {
     writeSource("temp.md", "temp");
     updateManifest(vault, ["temp.md"]);
-    expect(readManifest(vault).entries["temp.md"]).toMatch(/^[0-9a-f]{64}$/);
+    expect(readManifest(vault).entries["temp.md"]?.sha256).toMatch(/^[0-9a-f]{64}$/);
 
     rmSync(join(vault, "temp.md"));
     updateManifest(vault, ["temp.md"]);
@@ -150,6 +153,241 @@ describe("manifest persistence", () => {
     expect(writeManifestAtomic(vault, { "a.md": "x".repeat(64) })).toBe(false);
     // Different entries → write.
     expect(writeManifestAtomic(vault, { "a.md": "y".repeat(64) })).toBe(true);
+  });
+
+  test("an unknown schema_version is still refused by name", () => {
+    writeManifestBytes(JSON.stringify({ schema_version: 999, entries: {} }));
+    expect(() => readManifest(vault)).toThrow(/ingest manifest schema_version 999 not supported/);
+  });
+});
+
+/** Write raw bytes as the content manifest, for the versioned-fixture cases. */
+function writeManifestBytes(bytes: string): void {
+  const path = manifestPath(vault);
+  mkdirSync(join(path, ".."), { recursive: true });
+  writeFileSync(path, bytes, "utf8");
+}
+
+describe("extraction contract (t_586d5d8b)", () => {
+  test("the manifest records the contract fingerprint per entry and reads it back", () => {
+    writeSource("a.md", "a");
+    updateManifest(vault, ["a.md"]);
+
+    const manifest = readManifest(vault);
+    expect(manifest.contract).toEqual({
+      fingerprint: computeExtractionContractFingerprint(vault),
+    });
+
+    // The entry carries the fingerprint of the pass that recorded it, on
+    // disk, under the bumped schema version.
+    const onDisk = JSON.parse(readFileSync(manifestPath(vault), "utf8")) as {
+      schema_version: number;
+      contract: { fingerprint: string } | null;
+      entries: Record<string, { sha256: string; fingerprint?: string }>;
+    };
+    const live = computeExtractionContractFingerprint(vault);
+    expect(onDisk.schema_version).toBe(3);
+    expect(onDisk.contract?.fingerprint).toBe(live);
+    expect(onDisk.entries["a.md"]).toEqual({
+      sha256: hashFile(join(vault, "a.md")),
+      fingerprint: live,
+    });
+  });
+
+  test("the fingerprint is stable across calls and sensitive to its inputs", () => {
+    // Stable across calls: the recording is deterministic, not clocked.
+    expect(computeExtractionContractFingerprint(vault)).toBe(
+      computeExtractionContractFingerprint(vault),
+    );
+    // Sensitive to the allowlist: changing `extractable` changes the contract.
+    const before = computeExtractionContractFingerprint(vault);
+    writeSource("Brain/_brain.yaml", "schema_version: 1\nschema:\n  extractable:\n    - paper\n");
+    expect(computeExtractionContractFingerprint(vault)).not.toBe(before);
+  });
+
+  test("a v1 manifest (no contract field) is accepted and degrades to changed-contract", () => {
+    writeManifestBytes(JSON.stringify({ schema_version: 1, entries: { "a.md": "z".repeat(64) } }));
+    const manifest = readManifest(vault);
+    expect(manifest.entries["a.md"]).toEqual({ sha256: "z".repeat(64) });
+    expect(manifest.contract).toBeNull();
+  });
+
+  test("a v2 manifest (manifest-wide fingerprint only) degrades to every-entry-changed", () => {
+    // v1.78.0 wrote the fingerprint manifest-wide and bare-digest entries, so
+    // no entry carries a fingerprint of its own. The manifest-wide value
+    // cannot vouch for them: the read degrades to the changed marker - the
+    // fail-toward-reprocessing migration, never toward skipping.
+    writeSource("Inbox/a.md", "source a");
+    const digest = hashFile(join(vault, "Inbox", "a.md"));
+    writeManifestBytes(
+      JSON.stringify({
+        schema_version: 2,
+        contract: { fingerprint: computeExtractionContractFingerprint(vault) },
+        entries: { "Inbox/a.md": digest },
+      }),
+    );
+
+    const manifest = readManifest(vault);
+    expect(manifest.schema_version).toBe(2);
+    expect(manifest.entries["Inbox/a.md"]).toEqual({ sha256: digest });
+    expect(manifest.contract).toBeNull();
+
+    const plan = planBatches(vault, "Inbox", { maxBatchBytes: 10_000, maxBatchFiles: 100 });
+    expect(plan.contractChanged).toBe(true);
+    expect(plan.skipped).toEqual([]);
+  });
+
+  test("readManifest reports the schema version the FILE carries, not the write version", () => {
+    // No file yet: the current shape is the honest answer (nothing older exists).
+    expect(readManifest(vault).schema_version).toBe(3);
+
+    // An accepted v1 manifest must report itself as v1 - a diagnostic asking
+    // "which version is on disk" gets the truth, not the write constant.
+    writeManifestBytes(JSON.stringify({ schema_version: 1, entries: {} }));
+    expect(readManifest(vault).schema_version).toBe(1);
+
+    writeManifestBytes(
+      JSON.stringify({ schema_version: 2, entries: {}, contract: { fingerprint: "f".repeat(64) } }),
+    );
+    expect(readManifest(vault).schema_version).toBe(2);
+
+    writeManifestBytes(
+      JSON.stringify({
+        schema_version: 3,
+        entries: {},
+        contract: { fingerprint: "f".repeat(64) },
+      }),
+    );
+    expect(readManifest(vault).schema_version).toBe(3);
+  });
+
+  test("an explicitly-null contract writes the v1 shape; the omitted form stays the live upgrade", () => {
+    // Explicit null is a v1 read being round-tripped: it serializes back as
+    // v1, contract-less, keeping the changed-contract marker alive.
+    writeManifestAtomic(vault, { "a.md": "z".repeat(64) }, null);
+    const onDisk = JSON.parse(readFileSync(manifestPath(vault), "utf8")) as {
+      schema_version: number;
+      contract?: unknown;
+    };
+    expect(onDisk.schema_version).toBe(1);
+    expect("contract" in onDisk).toBe(false);
+    expect(readManifest(vault).contract).toBeNull();
+
+    // Omitted is the post-extraction write: it stamps the live fingerprint on
+    // the entry and lands as v3 - the one-time upgrade a real reprocessing
+    // pass makes true.
+    writeManifestAtomic(vault, { "a.md": "z".repeat(64) });
+    const upgraded = JSON.parse(readFileSync(manifestPath(vault), "utf8")) as {
+      schema_version: number;
+      contract: { fingerprint: string } | null;
+    };
+    expect(upgraded.schema_version).toBe(3);
+    expect(upgraded.contract?.fingerprint).toBe(computeExtractionContractFingerprint(vault));
+  });
+
+  test("a v1 manifest's next write lands as v3 with the fingerprint", () => {
+    writeSource("a.md", "a");
+    writeManifestBytes(
+      JSON.stringify({ schema_version: 1, entries: { "a.md": hashFile(join(vault, "a.md")) } }),
+    );
+    expect(readManifest(vault).contract).toBeNull();
+
+    updateManifest(vault, ["a.md"]);
+    const manifest = readManifest(vault);
+    expect(manifest.schema_version).toBe(3);
+    expect(manifest.contract).toEqual({
+      fingerprint: computeExtractionContractFingerprint(vault),
+    });
+  });
+
+  test("cleanup preserves the recorded contract (the direct write round-trips the field)", () => {
+    writeSource("doc.md", "the source bytes");
+    updateManifest(vault, ["doc.md"]);
+    const recorded = readManifest(vault).contract;
+
+    const plan = deleteBySource(vault, "doc.md", { confirm: true });
+    expect(plan.manifestEntryRemoved).toBe(true);
+
+    const after = readManifest(vault);
+    expect(after.entries["doc.md"]).toBeUndefined();
+    expect(after.contract).toEqual(recorded);
+  });
+
+  test("cleanup on a not-yet-reprocessed v1 manifest keeps the owed contract-changed reprocess", () => {
+    // The v1 manifest's remaining entry was extracted under the
+    // pre-fingerprint contract and never reprocessed. A cleanup that
+    // upgraded the file to v2 under the live contract would classify it
+    // `unchanged` forever - the owed one-time reprocess forfeited, silently.
+    writeSource("Inbox/a.md", "doomed source");
+    writeSource("Inbox/b.md", "surviving source");
+    writeManifestBytes(
+      JSON.stringify({
+        schema_version: 1,
+        entries: {
+          "Inbox/a.md": hashFile(join(vault, "Inbox", "a.md")),
+          "Inbox/b.md": hashFile(join(vault, "Inbox", "b.md")),
+        },
+      }),
+    );
+
+    const plan = deleteBySource(vault, "Inbox/a.md", { confirm: true });
+    expect(plan.manifestEntryRemoved).toBe(true);
+
+    // The round-trip is lossless: still the v1 shape, contract-less, so the
+    // changed-contract marker survives until a real reprocessing write.
+    const onDisk = JSON.parse(readFileSync(manifestPath(vault), "utf8")) as {
+      schema_version: number;
+      contract?: unknown;
+    };
+    expect(onDisk.schema_version).toBe(1);
+    expect("contract" in onDisk).toBe(false);
+    const after = readManifest(vault);
+    expect(after.contract).toBeNull();
+    expect(after.entries["Inbox/b.md"]).toBeDefined();
+
+    // The owed reprocess is still owed: the surviving byte-identical source
+    // reprocesses as contract-changed, never as an `unchanged` skip. (The
+    // deleted source itself is still on disk - originals go only with
+    // includeOriginals - and classifies `new` again, which is correct.)
+    const batches = planBatches(vault, "Inbox", { maxBatchBytes: 10_000, maxBatchFiles: 100 });
+    expect(batches.contractChanged).toBe(true);
+    expect(batches.skipped).toEqual([]);
+    const survivor = batches.batches.flatMap((b) => b.files).find((f) => f.path === "Inbox/b.md");
+    expect(survivor?.status).toBe("contract-changed");
+  });
+
+  test("ingesting one source after a contract change keeps the others contract-changed", () => {
+    // Regression (write-side trust review): the manifest-wide fingerprint
+    // stamp made the FIRST post-change ingest cancel the reprocess owed to
+    // every source it did not touch - the next plan reported them
+    // contract-current and skipped them. Per-entry fingerprints pin each
+    // entry to the contract it was recorded under.
+    writeSource("Inbox/a.md", "source a");
+    writeSource("Inbox/b.md", "source b");
+    updateManifest(vault, ["Inbox/a.md", "Inbox/b.md"]);
+
+    // The extraction contract changes (allowlist edit); only `a` is re-ingested.
+    writeSource("Brain/_brain.yaml", "schema_version: 1\nschema:\n  extractable:\n    - paper\n");
+    updateManifest(vault, ["Inbox/a.md"]);
+
+    // `a` carries the live fingerprint; `b` still predates the contract.
+    const live = computeExtractionContractFingerprint(vault);
+    const manifest = readManifest(vault);
+    expect(manifest.entries["Inbox/a.md"]?.fingerprint).toBe(live);
+    expect(manifest.entries["Inbox/b.md"]?.fingerprint).not.toBe(live);
+    expect(manifest.contract).toBeNull();
+
+    // Re-plan: `b` must still be contract-changed - never skipped, never
+    // silent. (`a` is byte-unchanged and current, but while ANY entry is
+    // stale the plan-level marker stays changed, so it reprocesses too -
+    // the fail-toward-reprocessing direction, until the last stale entry
+    // is rewritten.)
+    const plan = planBatches(vault, "Inbox", { maxBatchBytes: 10_000, maxBatchFiles: 100 });
+    expect(plan.contractChanged).toBe(true);
+    expect(plan.contractChangedFiles).toBe(2);
+    expect(plan.skipped).toEqual([]);
+    const b = plan.batches.flatMap((batch) => batch.files).find((f) => f.path === "Inbox/b.md");
+    expect(b?.status).toBe("contract-changed");
   });
 });
 

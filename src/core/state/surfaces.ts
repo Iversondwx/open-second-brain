@@ -72,6 +72,7 @@ import { lstatSync, readdirSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 import {
+  BRAIN_ARCHIVES_REL,
   BRAIN_ARTIFACTS_REL,
   BRAIN_CAPTURES_REL,
   BRAIN_CLAIM_GRAPH_FILE,
@@ -118,6 +119,7 @@ export const STATE_SURFACE_ID = Object.freeze({
   sessionImportLedger: "session_import_ledger",
   installManifest: "install_manifest",
   protectManifest: "protect_manifest",
+  bootstrapReceipt: "bootstrap_receipt",
   maintenanceLease: "maintenance_lease",
   maintenanceJournal: "maintenance_journal",
   hookAudit: "hook_audit",
@@ -154,6 +156,8 @@ export const STATE_SURFACE_ID = Object.freeze({
   rollupLedger: "rollup_ledger",
   proposalWatermark: "proposal_watermark",
   captureWatermark: "capture_watermark",
+  decisionLedger: "decision_ledger",
+  sourceArchives: "source_archives",
 } as const);
 
 export type StateSurfaceId = (typeof STATE_SURFACE_ID)[keyof typeof STATE_SURFACE_ID];
@@ -282,6 +286,7 @@ const DEAD_LETTER_DIR = "dead-letters";
 const SESSION_LEDGER_FILE = "session-import-ledger.json";
 const INSTALL_MANIFEST_FILE = "install.lock.json";
 const PROTECT_MANIFEST_FILE = "protect.lock.json";
+const BOOTSTRAP_RECEIPT_FILE = "bootstrap.lock.json";
 const MAINTENANCE_LEASE_FILE = "maintenance.sqlite";
 const MAINTENANCE_JOURNAL_FILE = `${MAINTENANCE_JOURNAL_STEM}.${JSONL_LEDGER_EXT}`;
 const HOOK_STATE_DIR = "hook-state";
@@ -523,6 +528,21 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
       "install manifest and the same cost: without it `brain unprotect` cannot tell a fence it " +
       "wrote from one an operator typed.",
     sources: ["src/core/brain/protect.ts"],
+  },
+  {
+    id: STATE_SURFACE_ID.bootstrapReceipt,
+    label: "bootstrap receipt",
+    tier: STATE_TIER.derived,
+    derive: derivedStore(BOOTSTRAP_RECEIPT_FILE),
+    override_env: null,
+    override_config_key: null,
+    carries_memory: false,
+    reason:
+      "What `o2b bootstrap` provisioned per harness target: the owned entries, the token NAME " +
+      "and non-secret prefix (never the material), and applied_at. Losing it makes the next " +
+      "bootstrap re-provision honestly and `--check` report the receipt missing; it is never a " +
+      "credential.",
+    sources: ["src/cli/bootstrap/receipt.ts"],
   },
   {
     id: STATE_SURFACE_ID.maintenanceLease,
@@ -1032,6 +1052,38 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
       "The id of the last capture a `/catchup` reply acknowledged. A dot-file so the vault " +
       "walker never indexes it; deleting it replays the acknowledgement, not the captures.",
     sources: ["src/core/brain/paths.ts"],
+  },
+  {
+    id: STATE_SURFACE_ID.decisionLedger,
+    label: "decision ledger",
+    tier: STATE_TIER.vaultContent,
+    derive: brainTree("logs", "decisions"),
+    override_env: DEVICE_ID_ENV,
+    override_config_key: DEVICE_ID_CONFIG_KEY,
+    carries_memory: false,
+    reason:
+      "One JSONL row per gate decision - which rule allowed, asked or denied which operation - " +
+      "sharded by month and device so two machines syncing one vault never write the same file. " +
+      "The device id names THIS machine's shard; the reader merges every shard it finds. It is " +
+      "the only queryable record of why a write was refused, so nothing regenerates a row that " +
+      "was never appended.",
+    sources: ["src/core/brain/permissions/ledger.ts"],
+  },
+  {
+    id: STATE_SURFACE_ID.sourceArchives,
+    label: "source archives",
+    tier: STATE_TIER.vaultContent,
+    derive: (vault) => join(vault, BRAIN_ARCHIVES_REL),
+    override_env: null,
+    override_config_key: null,
+    carries_memory: true,
+    reason:
+      "The redacted bytes an ingest summary page's knowledge was read from, one content-addressed " +
+      "file per distinct source text. This is durable evidence, not scratch: deleting an entry " +
+      "destroys the ability to re-verify the page against its source - the current vault content " +
+      "is untouched, which is exactly what separates it from a rebuildable derived store, and " +
+      "there is no TTL to bring it back.",
+    sources: ["src/core/brain/provenance/source-archive.ts"],
   },
 ]);
 

@@ -19,6 +19,11 @@ import {
 } from "../../../core/brain/entities/types.ts";
 import { pruneEntityLabels } from "../../../core/brain/entities/label-hygiene.ts";
 import {
+  deriveEntityLexicon,
+  ENTITY_LEXICON_ARTIFACT_REL,
+  writeEntityLexicon,
+} from "../../../core/brain/entities/lexicon.ts";
+import {
   brainVerbContext,
   fail,
   info,
@@ -67,10 +72,13 @@ export async function cmdBrainEntity(argv: string[]): Promise<number> {
       return entityArchive(rest);
     case "prune":
       return entityPrune(rest);
+    case "lexicon":
+      return entityLexicon(rest);
     default:
       return usageError(
         "brain entity requires a subcommand: set <category> <name> | get <name> | list | " +
-          "relate <from> <relation> <to> | archive <name> [--restore] | prune [--confirm]",
+          "relate <from> <relation> <to> | archive <name> [--restore] | " +
+          "prune [--confirm] [--include-advisory] | lexicon rebuild [--apply]",
       );
   }
 }
@@ -210,12 +218,14 @@ function entityPrune(argv: string[]): number {
   const { flags } = parse(argv, {
     vault: { type: "string" },
     confirm: { type: "boolean" },
+    "include-advisory": { type: "boolean" },
     json: { type: "boolean" },
   });
   const { vault } = brainVerbContext(flags);
   const confirm = flags["confirm"] === true;
+  const includeAdvisory = flags["include-advisory"] === true;
   try {
-    const result = pruneEntityLabels(vault, { confirm, now: new Date() });
+    const result = pruneEntityLabels(vault, { confirm, includeAdvisory, now: new Date() });
     if (flags["json"]) {
       okJson({
         confirmed: result.confirmed,
@@ -225,9 +235,11 @@ function entityPrune(argv: string[]): number {
           name: c.name,
           status: c.status,
           reason: c.reason,
+          advisory: c.advisory,
           path: c.path,
           inbound_references: [...c.inboundReferences],
         })),
+        advisory_skipped: result.advisorySkipped,
         removed: [...result.removed],
         edges_stripped: result.edgesStripped,
         snapshot_run_id: result.snapshotRunId,
@@ -235,12 +247,22 @@ function entityPrune(argv: string[]): number {
       });
       return 0;
     }
+    const advisoryNote =
+      result.advisorySkipped > 0
+        ? ` (${result.advisorySkipped} advisory finding(s) skipped - a single-token shout ` +
+          "or a common-word run; the doctor reports them)"
+        : "";
     if (result.candidates.length === 0) {
-      ok("entity prune: no malformed labels found");
+      if (result.advisorySkipped > 0) {
+        ok(`entity prune: no structural malformed labels found${advisoryNote}`);
+        info("  re-run with --include-advisory to prune the advisory classes too");
+      } else {
+        ok("entity prune: no malformed labels found");
+      }
       return 0;
     }
     if (result.confirmed) {
-      ok(`entity prune: removed ${result.removed.length} node(s)`);
+      ok(`entity prune: removed ${result.removed.length} node(s)${advisoryNote}`);
       for (const c of result.candidates) ok(`  - ${c.id} (${c.reason}) ${JSON.stringify(c.name)}`);
       if (result.edgesStripped > 0) ok(`  stripped ${result.edgesStripped} inbound edge(s)`);
       if (result.snapshotRunId) {
@@ -249,7 +271,10 @@ function entityPrune(argv: string[]): number {
       }
       return 0;
     }
-    ok(`entity prune (DRY RUN): ${result.candidates.length} malformed label(s) WOULD be removed:`);
+    ok(
+      `entity prune (DRY RUN): ${result.candidates.length} malformed label(s) WOULD be ` +
+        `removed${advisoryNote}:`,
+    );
     for (const c of result.candidates) {
       const edges =
         c.inboundReferences.length > 0
@@ -266,6 +291,59 @@ function entityPrune(argv: string[]): number {
       return 1;
     }
     return fail(message);
+  }
+}
+
+/**
+ * `o2b brain entity lexicon rebuild` (recall-quality A4): re-derive the
+ * store-learned entity lexicon over the vault's operator pages. Dry-run
+ * report by default; `--apply` writes ONLY the derived artifact
+ * (`Brain/entities/lexicon.json`) through the atomic, vault-identity-
+ * guarded derived-artifact writer. A derived write mutates no entity node
+ * and removes nothing, so it never needs `--confirm` - the flag reserved
+ * for destructive work (see `entity prune`).
+ */
+function entityLexicon(argv: string[]): number {
+  const sub = argv[0];
+  if (sub !== "rebuild") {
+    return fail("brain entity lexicon requires a subcommand: rebuild [--apply]");
+  }
+  const { flags } = parse(argv.slice(1), {
+    vault: { type: "string" },
+    apply: { type: "boolean" },
+    json: { type: "boolean" },
+  });
+  const { vault } = brainVerbContext(flags);
+  try {
+    const doc = deriveEntityLexicon(vault, { now: new Date() });
+    const applied = flags["apply"] === true;
+    const path = applied ? writeEntityLexicon(vault, doc) : null;
+    const entries = Object.keys(doc.entries).length;
+    const scope = doc.caseful ? "caseful corpus" : "caseless corpus (case verdicts stay off)";
+    if (flags["json"]) {
+      okJson({
+        applied,
+        schema: doc.schema,
+        entries,
+        caseful: doc.caseful,
+        corpus_scope: doc.corpus_scope,
+        dataset_hash: doc.dataset_hash,
+        generated_at: doc.generated_at,
+        ...(path !== null ? { path } : {}),
+      });
+      return 0;
+    }
+    if (applied) {
+      ok(`entity lexicon rebuild: wrote ${entries} token entries (${scope})`);
+      info(`  artifact: ${ENTITY_LEXICON_ARTIFACT_REL}; dataset ${doc.dataset_hash}`);
+    } else {
+      ok(`entity lexicon rebuild (DRY RUN): ${entries} token entries WOULD be written (${scope})`);
+      info(`  dataset ${doc.dataset_hash}`);
+      info(`  re-run with --apply to write ${ENTITY_LEXICON_ARTIFACT_REL}`);
+    }
+    return 0;
+  } catch (exc) {
+    return fail(`brain entity lexicon rebuild failed: ${(exc as Error).message}`);
   }
 }
 

@@ -15,6 +15,11 @@
  *     forms, minimum length 3): a claim whose subject and object both
  *     anchor in the text commits with `extractor: "agent_stated"`; an
  *     ungrounded claim is reported back with machine reason codes.
+ *     The store-learned lexicon is resolved beside the gate
+ *     (`resolveEntityLexicon`, fail-open null), so a verdict here
+ *     never anchors a form the creation gate refuses; with no fresh
+ *     artifact every verdict is byte-identical to the pre-lexicon
+ *     behavior.
  *     Per-claim partial commit is safe here because each event is an
  *     independent append in an append-only ledger and the outcome
  *     reports exactly what landed.
@@ -28,9 +33,15 @@
 
 import { isKnownRelation, normalizeRelation } from "../../graph/relation-vocab.ts";
 import { anchorEntityForms, type AtomicEntityLike } from "../atomic-facts.ts";
-import { normalizeEntityName } from "../entities/canonical.ts";
+import { normalizeEntityName, type EntityLexiconHandle } from "../entities/canonical.ts";
+import { resolveEntityLexicon } from "../entities/lexicon.ts";
 import type { AppendClaimInput, AppendClaimResult } from "./store.ts";
-import { appendClaimEvent, ISO_UTC_TS_RE } from "./store.ts";
+import {
+  appendClaimEvent,
+  ISO_UTC_TS_RE,
+  isValidClaimSampleId,
+  SAMPLE_ID_MAX_LENGTH,
+} from "./store.ts";
 import type { ClaimExtractor } from "./types.ts";
 
 /** How this release tags agent-stated claims. */
@@ -53,6 +64,17 @@ export interface StatedClaimsPayload {
   readonly ts: string;
   /** Provenance wikilink or vault-relative path. */
   readonly source: string;
+  /**
+   * Optional attribution id (answer-trust, task B2): the recall/
+   * context-pack quality-sample id these claims were stated against.
+   * Trimmed and shape-checked when present - non-empty, at most 256
+   * characters, no control characters; anything else is a named
+   * refusal, never coerced to absent - and threaded trimmed onto every
+   * committed event as `sample_id` (the store stores the same trimmed
+   * form). Opaque: treated as an opaque token end to end and never
+   * logged beside answer or source text.
+   */
+  readonly sampleId?: string;
 }
 
 export interface StatedClaimsOptions {
@@ -123,16 +145,21 @@ function ungroundedReasons(
   claim: StatedClaim,
   text: string,
   entities: ReadonlyArray<AtomicEntityLike>,
+  lexicon: EntityLexiconHandle | null,
 ): ReadonlyArray<StatedClaimRefusalReason> {
   const reasons: StatedClaimRefusalReason[] = [];
   if (normalizeEntityName(claim.subject) === "") {
     reasons.push("missing_subject");
-  } else if (anchorEntityForms(text, statedAnchorForms(claim.subject, entities)).length === 0) {
+  } else if (
+    anchorEntityForms(text, statedAnchorForms(claim.subject, entities), { lexicon }).length === 0
+  ) {
     reasons.push("subject_unanchored");
   }
   if (claim.object.trim() === "") {
     reasons.push("missing_object");
-  } else if (anchorEntityForms(text, statedAnchorForms(claim.object, entities)).length === 0) {
+  } else if (
+    anchorEntityForms(text, statedAnchorForms(claim.object, entities), { lexicon }).length === 0
+  ) {
     reasons.push("object_unanchored");
   }
   return reasons;
@@ -176,12 +203,31 @@ export function appendStatedClaims(
       `stated claims: ts must be canonical ISO-8601 UTC: ${JSON.stringify(payload.ts)}`,
     );
   }
+  // Sample id (answer-trust, task B2): presence-gated, part of the
+  // whole-call promise. The value is trimmed and must pass the same
+  // shape check the store append applies - non-empty, at most 256
+  // characters, no control characters (review L2.1) - so an unacceptable
+  // id refuses HERE, before the first write, through the typed refusal
+  // channel like the agent and ts checks above, never coerced to absent
+  // and never surfacing mid-loop as the store's plain error.
+  const sampleId = payload.sampleId === undefined ? undefined : payload.sampleId.trim();
+  if (sampleId !== undefined && !isValidClaimSampleId(sampleId)) {
+    throw new StatedClaimsRefusal(
+      `stated claims: sample_id must be a non-empty string of at most ${SAMPLE_ID_MAX_LENGTH} characters without control characters`,
+    );
+  }
 
   const entities = opts.entities ?? [];
+  // The same store-learned lexicon the creation gate resolves (fail-open
+  // null), threaded into the shared anchoring kernel so a stated value
+  // whose only forms the gate refuses is reported unanchored exactly as
+  // the creation boundary refuses it (recall-quality M6). No artifact,
+  // and every verdict is byte-identical to the pre-lexicon behavior.
+  const lexicon = resolveEntityLexicon(vault);
   const committed: AppendClaimResult[] = [];
   const ungrounded: UngroundedStatedClaim[] = [];
   for (const claim of payload.claims) {
-    const reasons = ungroundedReasons(claim, payload.text, entities);
+    const reasons = ungroundedReasons(claim, payload.text, entities, lexicon);
     if (reasons.length > 0) {
       ungrounded.push(Object.freeze({ claim, reasons: Object.freeze(reasons) }));
       continue;
@@ -194,6 +240,7 @@ export function appendStatedClaims(
       value: claim.object.trim(),
       extractor: AGENT_STATED,
       source,
+      ...(sampleId !== undefined ? { sample_id: sampleId } : {}),
     };
     committed.push(
       appendClaimEvent(vault, input, {

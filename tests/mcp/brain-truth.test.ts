@@ -5,7 +5,7 @@
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,8 +13,11 @@ import { bootstrapBrain } from "../../src/core/brain/init.ts";
 import { readClaimEvents, appendClaimEvent } from "../../src/core/brain/truth/store.ts";
 import { computeTruthStateWithConflicts } from "../../src/core/brain/truth/conflicts.ts";
 import { upsertEntity } from "../../src/core/brain/entities/registry.ts";
+import { emitContextPackOutcome } from "../../src/core/brain/context-pack-outcome.ts";
+import { emitContextReceipt } from "../../src/core/brain/context-receipts.ts";
+import { continuityLogPath } from "../../src/core/brain/continuity/store.ts";
 import { atomicWriteFileSync } from "../../src/core/fs-atomic.ts";
-import { TRANSPORT_REACH } from "../../src/core/graph/transport-reach.ts";
+import { TRANSPORT_REACH, type TransportReach } from "../../src/core/graph/transport-reach.ts";
 import { REMOTE_DENY_VISIBILITY_TOKEN } from "../../src/core/graph/visibility.ts";
 import { JSONRPC_VERSION, MCPServer, PROTOCOL_VERSION } from "../../src/mcp/index.ts";
 
@@ -813,4 +816,456 @@ test("ingest refuses a malformed validity bound as invalid params, not an intern
     expect(raw.result?.isError).toBeUndefined();
   }
   expect(readClaimEvents(vault).events).toHaveLength(0);
+});
+
+// ----- state sample_id + provenance-hydrated reads (answer-trust, B4) -----
+
+interface ClaimProvenanceRow {
+  readonly sample_id: string;
+  readonly receipt: {
+    readonly id: string;
+    readonly created_at: string;
+    readonly trigger: string | null;
+    readonly items: ReadonlyArray<{ readonly id: string; readonly path?: string }>;
+    readonly withheld: boolean;
+  } | null;
+  readonly outcome: {
+    readonly id: string;
+    readonly first_pass_success: boolean | null;
+    readonly evidence_verdict?: string;
+  } | null;
+  readonly timestamp_inverted: boolean;
+}
+
+test("state accepts a sample_id and echoes it on each committed claim", async () => {
+  seedRegistry();
+  const server = new MCPServer({ vault, configPath });
+  await initialize(server);
+  const body = (await call(server, {
+    operation: "state",
+    claims: [{ subject: "Alice Mason", relation: "extends", object: "Project Atlas" }],
+    text: "Alice Mason said the Atlas extension plan refines Project Atlas scope.",
+    source: "[[Brain/notes/session.md]]",
+    sample_id: "rcpt-2026-0601-abcd",
+  })) as unknown as StateResponse;
+  expect(body.ok).toBe(true);
+  expect(body.committed).toHaveLength(1);
+  expect((body.committed[0] as unknown as { sample_id?: string }).sample_id).toBe(
+    "rcpt-2026-0601-abcd",
+  );
+  const [stored] = readClaimEvents(vault).events;
+  expect(stored!.sample_id).toBe("rcpt-2026-0601-abcd");
+});
+
+test("state refuses a non-string sample_id as invalid params", async () => {
+  seedRegistry();
+  const server = new MCPServer({ vault, configPath });
+  await initialize(server);
+  const raw = await callRaw(server, {
+    operation: "state",
+    claims: [{ subject: "Alice Mason", relation: "extends", object: "Project Atlas" }],
+    text: "Alice Mason said the Atlas extension plan refines Project Atlas scope.",
+    source: "[[Brain/notes/session.md]]",
+    sample_id: 42,
+  });
+  expect(raw.error).toBeDefined();
+  expect(raw.error!.code).toBe(-32602);
+  expect(raw.error!.message).toMatch(/sample_id/);
+  expect(readClaimEvents(vault).events).toHaveLength(0);
+});
+
+test("state refuses a blank sample_id through the named refusal, before any write", async () => {
+  seedRegistry();
+  const server = new MCPServer({ vault, configPath });
+  await initialize(server);
+  // A blank id is a named refusal, never coerced to absent.
+  const raw = await callRaw(server, {
+    operation: "state",
+    claims: [{ subject: "Alice Mason", relation: "extends", object: "Project Atlas" }],
+    text: "Alice Mason said the Atlas extension plan refines Project Atlas scope.",
+    source: "[[Brain/notes/session.md]]",
+    sample_id: "   ",
+  });
+  expect(raw.error).toBeDefined();
+  expect(raw.error!.code).toBe(-32602);
+  expect(raw.error!.message).toMatch(/sample_id/);
+  expect(readClaimEvents(vault).events).toHaveLength(0);
+});
+
+test("state refuses an over-long or control-character sample_id, naming the limit", async () => {
+  // L2.1 regression: the same shape check the core boundaries apply -
+  // at most 256 characters, no control characters - mapped to the same
+  // invalid-params failure class as the blank-id refusal.
+  seedRegistry();
+  const server = new MCPServer({ vault, configPath });
+  await initialize(server);
+  for (const bad of ["r".repeat(300), "rcpt\u0000-1", "rcpt\u0007-1"]) {
+    const raw = await callRaw(server, {
+      operation: "state",
+      claims: [{ subject: "Alice Mason", relation: "extends", object: "Project Atlas" }],
+      text: "Alice Mason said the Atlas extension plan refines Project Atlas scope.",
+      source: "[[Brain/notes/session.md]]",
+      sample_id: bad,
+    });
+    expect(raw.error).toBeDefined();
+    expect(raw.error!.code).toBe(-32602);
+    expect(raw.error!.message).toMatch(
+      /sample_id must be a non-empty string of at most 256 characters without control characters/,
+    );
+  }
+  expect(readClaimEvents(vault).events).toHaveLength(0);
+});
+
+test("events hydrate provenance for claims carrying a sample_id", async () => {
+  seedRegistry();
+  writeSourcePage("session.md");
+  // The receipt item's path is filtered at the caller's reach, and a
+  // path naming no page fails closed like any unreadable one - back the
+  // item with a real page so the join may unfold it.
+  writeSourcePage("alpha.md");
+  const server = new MCPServer({ vault, configPath });
+  await initialize(server);
+  // An explicit past stamp: a defaulted `now` receipt can land up to a
+  // second AFTER the claim's floored assertion stamp, which is a genuine
+  // timestamp inversion the join must flag - the fixture keeps the
+  // receipt unambiguously before the claim.
+  const receipt = emitContextReceipt(vault, {
+    options: { host: "mcp", trigger: "context_pack", createdAt: "2026-06-02T09:00:00.000Z" },
+    items: [{ id: "note-alpha", path: "Brain/notes/alpha.md", tokens: 40 }],
+    finalText: "the final answer text",
+  });
+  await call(server, {
+    operation: "state",
+    claims: [{ subject: "Alice Mason", relation: "extends", object: "Project Atlas" }],
+    text: "Alice Mason said the Atlas extension plan refines Project Atlas scope.",
+    source: "[[Brain/notes/session.md]]",
+    sample_id: receipt.id,
+  });
+  const body = (await call(server, { operation: "events" })) as unknown as {
+    events: ReadonlyArray<ClaimEventRow & { sample_id?: string; provenance?: ClaimProvenanceRow }>;
+  };
+  expect(body.events).toHaveLength(1);
+  const row = body.events[0]!;
+  expect(row.sample_id).toBe(receipt.id);
+  expect(row.provenance).toBeDefined();
+  expect(row.provenance!.sample_id).toBe(receipt.id);
+  // Receipt known.
+  expect(row.provenance!.receipt).not.toBeNull();
+  expect(row.provenance!.receipt!.id).toBe(receipt.id);
+  expect(row.provenance!.receipt!.items).toEqual([
+    { id: "note-alpha", path: "Brain/notes/alpha.md" },
+  ]);
+  // Outcome unknown - absent, never invented.
+  expect(row.provenance!.outcome).toBeNull();
+  expect(row.provenance!.timestamp_inverted).toBe(false);
+});
+
+test("events leave claims without a sample_id exactly as today", async () => {
+  seedRegistry();
+  writeSourcePage("session.md");
+  const server = new MCPServer({ vault, configPath });
+  await initialize(server);
+  await call(server, {
+    operation: "state",
+    claims: [{ subject: "Alice Mason", relation: "extends", object: "Project Atlas" }],
+    text: "Alice Mason said the Atlas extension plan refines Project Atlas scope.",
+    source: "[[Brain/notes/session.md]]",
+  });
+  const body = (await call(server, { operation: "events" })) as unknown as {
+    events: ReadonlyArray<Record<string, unknown>>;
+  };
+  expect(body.events).toHaveLength(1);
+  expect("provenance" in body.events[0]!).toBe(false);
+  expect("sample_id" in body.events[0]!).toBe(false);
+});
+
+test("events hydrate a posted outcome row with its first-pass and evidence verdicts", async () => {
+  seedRegistry();
+  writeSourcePage("session.md");
+  const server = new MCPServer({ vault, configPath });
+  await initialize(server);
+  const receipt = emitContextReceipt(vault, {
+    options: { host: "mcp", trigger: "context_pack" },
+    items: [{ id: "note-alpha", path: "Brain/notes/alpha.md", tokens: 40 }],
+    finalText: "the final answer text",
+  });
+  const posted = emitContextPackOutcome(
+    vault,
+    { sampleId: receipt.id, firstPassSuccess: false, repairRequired: true },
+    true,
+  );
+  expect(posted).not.toBeNull();
+  await call(server, {
+    operation: "state",
+    claims: [{ subject: "Alice Mason", relation: "extends", object: "Project Atlas" }],
+    text: "Alice Mason said the Atlas extension plan refines Project Atlas scope.",
+    source: "[[Brain/notes/session.md]]",
+    sample_id: receipt.id,
+  });
+  const body = (await call(server, { operation: "events" })) as unknown as {
+    events: ReadonlyArray<{ provenance?: ClaimProvenanceRow }>;
+  };
+  const provenance = body.events[0]!.provenance!;
+  expect(provenance.outcome).not.toBeNull();
+  expect(provenance.outcome!.first_pass_success).toBe(false);
+  expect(provenance.outcome!.evidence_verdict).toBe("unclaimed");
+});
+
+test("two claims sharing a sample_id carry per-event inversion flags", async () => {
+  // H2 regression: the inversion flag compares EACH claim's own ts
+  // against the claimed receipt's created_at. Resolving per sample_id
+  // instead of per event let one page row's verdict overwrite the
+  // other's in the per-id map, so with one claim stated before its
+  // receipt and one after, both rows rendered the same flag - the
+  // earlier claim's inversion disappeared. Resolution is per event now,
+  // attached by page position; the page itself still renders in the
+  // ledger's ts-ascending order, so the flag must follow each row's ts
+  // whichever way the ledger was appended.
+  const receiptAt = "2026-06-02T09:00:00.000Z";
+
+  const pageInversionFlags = async (
+    server: MCPServer,
+  ): Promise<ReadonlyArray<{ ts: string; inverted: boolean }>> => {
+    const body = (await call(server, { operation: "events" })) as unknown as {
+      events: ReadonlyArray<{ ts: string; provenance?: ClaimProvenanceRow }>;
+    };
+    expect(body.events).toHaveLength(2);
+    return body.events.map((event) => ({
+      ts: event.ts,
+      inverted: event.provenance?.timestamp_inverted === true,
+    }));
+  };
+
+  // Order 1: the inverted claim appended first.
+  writeSourcePage("a.md");
+  const receipt = emitContextReceipt(vault, {
+    options: { host: "mcp", trigger: "context_pack", createdAt: receiptAt },
+    items: [{ id: "note-a", path: "Brain/notes/a.md", tokens: 40 }],
+    finalText: "the final answer text",
+  });
+  appendClaimEvent(vault, {
+    ts: "2026-06-02T08:00:00Z",
+    agent: "claude",
+    entity: "Entity Early",
+    aspect: "employer",
+    value: "Google",
+    source: "[[Brain/notes/a.md]]",
+    sample_id: receipt.id,
+  });
+  appendClaimEvent(vault, {
+    ts: "2026-06-02T10:00:00Z",
+    agent: "claude",
+    entity: "Entity Late",
+    aspect: "employer",
+    value: "Meta",
+    source: "[[Brain/notes/a.md]]",
+    sample_id: receipt.id,
+  });
+  const server = new MCPServer({ vault, configPath });
+  await initialize(server);
+  expect(await pageInversionFlags(server)).toEqual([
+    { ts: "2026-06-02T08:00:00Z", inverted: true },
+    { ts: "2026-06-02T10:00:00Z", inverted: false },
+  ]);
+
+  // Order 2: the inverted claim appended last, in a fresh ledger.
+  const b = secondVault();
+  try {
+    mkdirSync(join(b.vault, "Brain", "notes"), { recursive: true });
+    writeFileSync(join(b.vault, "Brain", "notes", "a.md"), "---\nkind: note\n---\n\na page\n");
+    const receiptB = emitContextReceipt(b.vault, {
+      options: { host: "mcp", trigger: "context_pack", createdAt: receiptAt },
+      items: [{ id: "note-a", path: "Brain/notes/a.md", tokens: 40 }],
+      finalText: "the final answer text",
+    });
+    appendClaimEvent(b.vault, {
+      ts: "2026-06-02T10:00:00Z",
+      agent: "claude",
+      entity: "Entity Late",
+      aspect: "employer",
+      value: "Meta",
+      source: "[[Brain/notes/a.md]]",
+      sample_id: receiptB.id,
+    });
+    appendClaimEvent(b.vault, {
+      ts: "2026-06-02T08:00:00Z",
+      agent: "claude",
+      entity: "Entity Early",
+      aspect: "employer",
+      value: "Google",
+      source: "[[Brain/notes/a.md]]",
+      sample_id: receiptB.id,
+    });
+    const serverB = new MCPServer({ vault: b.vault, configPath: b.configPath });
+    await initialize(serverB);
+    expect(await pageInversionFlags(serverB)).toEqual([
+      { ts: "2026-06-02T08:00:00Z", inverted: true },
+      { ts: "2026-06-02T10:00:00Z", inverted: false },
+    ]);
+  } finally {
+    rmSync(b.configHome, { recursive: true, force: true });
+  }
+});
+
+test("one receipt with an unparseable createdAt degrades per claim, not per page", async () => {
+  // M4 regression: the continuity reader validates createdAt on append
+  // only, so a hand-edited shard can carry a stamp no append would
+  // accept. The events op must still answer ok with every row - the
+  // sampled claim names an unreadable receipt and renders it unknown,
+  // the unsampled claim renders byte-identically - instead of throwing
+  // a plain internal error for the whole page.
+  writeSourcePage("session.md");
+  const receipt = emitContextReceipt(vault, {
+    options: { host: "mcp", trigger: "context_pack", createdAt: "2026-06-02T09:00:00.000Z" },
+    items: [{ id: "note-alpha", path: "Brain/notes/alpha.md", tokens: 40 }],
+    finalText: "the final answer text",
+  });
+  const shard = continuityLogPath(vault, receipt.createdAt.slice(0, 7));
+  const text = readFileSync(shard, "utf8");
+  writeFileSync(
+    shard,
+    text.replace(
+      JSON.stringify(receipt),
+      JSON.stringify({ ...receipt, createdAt: "2026-06-garbage" }),
+    ),
+  );
+  appendClaimEvent(vault, {
+    ts: "2026-06-02T10:00:00Z",
+    agent: "claude",
+    entity: "Alice Mason",
+    aspect: "employer",
+    value: "Google",
+    source: "[[Brain/notes/session.md]]",
+    sample_id: receipt.id,
+  });
+  appendClaimEvent(vault, {
+    ts: "2026-06-03T10:00:00Z",
+    agent: "claude",
+    entity: "Bob Doe",
+    aspect: "employer",
+    value: "Meta",
+    source: "[[Brain/notes/session.md]]",
+  });
+  const server = new MCPServer({ vault, configPath });
+  await initialize(server);
+  const body = (await call(server, { operation: "events" })) as unknown as {
+    ok: boolean;
+    events: ReadonlyArray<{
+      entity: string;
+      provenance?: ClaimProvenanceRow | null;
+    }>;
+  };
+  expect(body.ok).toBe(true);
+  expect(body.events).toHaveLength(2);
+  const sampled = body.events.find((event) => event.entity === "alice mason")!;
+  expect(sampled.provenance).toBeDefined();
+  // Receipt unreadable: it renders unknown, never a failed read.
+  expect(sampled.provenance!.receipt).toBeNull();
+  const unsampled = body.events.find((event) => event.entity === "bob doe")!;
+  expect("provenance" in unsampled).toBe(false);
+});
+
+// ----- provenance at the caller's reach (answer-trust repair M2/F3) -----
+
+const RULE_RECEIPT_STAMP = "2026-06-02T09:00:00.000Z";
+
+function emitClaimOnReceipt(receiptId: string): void {
+  appendClaimEvent(vault, {
+    ts: "2026-06-02T10:00:00Z",
+    agent: "claude",
+    entity: "Alice Mason",
+    aspect: "employer",
+    value: "Google",
+    source: "[[Brain/notes/session.md]]",
+    sample_id: receiptId,
+  });
+}
+
+async function eventsProvenanceAt(
+  reach: TransportReach,
+): Promise<ReadonlyArray<ClaimProvenanceRow | undefined>> {
+  const server = new MCPServer({ vault, configPath }, { reach });
+  await initialize(server);
+  const body = (await call(server, { operation: "events" })) as unknown as {
+    events: ReadonlyArray<{ provenance?: ClaimProvenanceRow }>;
+  };
+  expect(body.events).toHaveLength(1);
+  return body.events.map((event) => event.provenance);
+}
+
+test("a rule-only injection receipt answers provenance as an unknown id below local reach", async () => {
+  writeSourcePage("session.md");
+  const receipt = emitContextReceipt(vault, {
+    options: { host: "mcp", trigger: "session_inject", createdAt: RULE_RECEIPT_STAMP },
+    items: [{ id: "standing-rules" }, { id: "scoped-rules" }],
+    finalText: "constitution and scoped rules",
+  });
+  emitClaimOnReceipt(receipt.id);
+  const [remoteProvenance] = await eventsProvenanceAt(TRANSPORT_REACH.remote);
+  // The unknown-id answer: `brain_context_receipts show` refuses this
+  // receipt below local reach and `list` leaves it out, so a claim's
+  // provenance must not answer for it either - even a withheld-shaped
+  // row would confirm the operator's rules were injected.
+  expect(remoteProvenance!.receipt).toBeNull();
+  expect(JSON.stringify(remoteProvenance)).not.toContain("standing-rules");
+  const [localProvenance] = await eventsProvenanceAt(TRANSPORT_REACH.local);
+  expect(localProvenance!.receipt).not.toBeNull();
+  expect(localProvenance!.receipt!.items).toEqual([
+    { id: "standing-rules" },
+    { id: "scoped-rules" },
+  ]);
+});
+
+test("a mixed receipt keeps its non-rule items and drops the rule items below local reach", async () => {
+  writeSourcePage("session.md");
+  writeSourcePage("alpha.md");
+  const receipt = emitContextReceipt(vault, {
+    options: { host: "mcp", trigger: "session_inject", createdAt: RULE_RECEIPT_STAMP },
+    items: [
+      { id: "standing-rules" },
+      { id: "note-alpha", path: "Brain/notes/alpha.md", tokens: 40 },
+    ],
+    finalText: "rules plus a note",
+  });
+  emitClaimOnReceipt(receipt.id);
+  const [remoteProvenance] = await eventsProvenanceAt(TRANSPORT_REACH.remote);
+  // Not rule-only, so the receipt stays known - shaped as the receipts
+  // surface shapes it, with the rule items and nothing else removed.
+  expect(remoteProvenance!.receipt).not.toBeNull();
+  expect(remoteProvenance!.receipt!.items).toEqual([
+    { id: "note-alpha", path: "Brain/notes/alpha.md" },
+  ]);
+  const [localProvenance] = await eventsProvenanceAt(TRANSPORT_REACH.local);
+  expect(localProvenance!.receipt!.items).toEqual([
+    { id: "standing-rules" },
+    { id: "note-alpha", path: "Brain/notes/alpha.md" },
+  ]);
+});
+
+test("a receipt item whose path is withheld at the caller's reach leaves the provenance", async () => {
+  writeSourcePage("session.md");
+  writeSourcePage("alpha.md");
+  writeSourcePage("secret.md", `\nvisibility: [${REMOTE_DENY_VISIBILITY_TOKEN}]`);
+  const receipt = emitContextReceipt(vault, {
+    options: { host: "mcp", trigger: "context_pack", createdAt: RULE_RECEIPT_STAMP },
+    items: [
+      { id: "note-secret", path: "Brain/notes/secret.md" },
+      { id: "note-alpha", path: "Brain/notes/alpha.md" },
+    ],
+    finalText: "two notes",
+  });
+  emitClaimOnReceipt(receipt.id);
+  const [remoteProvenance] = await eventsProvenanceAt(TRANSPORT_REACH.remote);
+  // The same visibility rule the event rows of this report are gated
+  // by, applied to the items the join unfolds: a path the caller may
+  // not read drops exactly like a row naming it would.
+  expect(remoteProvenance!.receipt!.items).toEqual([
+    { id: "note-alpha", path: "Brain/notes/alpha.md" },
+  ]);
+  expect(JSON.stringify(remoteProvenance)).not.toContain("secret");
+  const [localProvenance] = await eventsProvenanceAt(TRANSPORT_REACH.local);
+  expect(localProvenance!.receipt!.items).toEqual([
+    { id: "note-secret", path: "Brain/notes/secret.md" },
+    { id: "note-alpha", path: "Brain/notes/alpha.md" },
+  ]);
 });

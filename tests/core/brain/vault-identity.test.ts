@@ -45,6 +45,7 @@ import {
 import { writeHandoffNote } from "../../../src/core/brain/handoff.ts";
 import { appendEditHistory } from "../../../src/core/brain/health/edit-history.ts";
 import { recordThesis } from "../../../src/core/brain/health/thesis.ts";
+import { exportSecretBundle, importSecretBundle } from "../../../src/core/brain/secrets/bundle.ts";
 import { applyHygienePlan } from "../../../src/core/brain/hygiene/apply.ts";
 import type { HygienePlan } from "../../../src/core/brain/hygiene/plan.ts";
 import { bootstrapBrain } from "../../../src/core/brain/init.ts";
@@ -78,10 +79,13 @@ import { writeRollupLedger } from "../../../src/core/brain/rollup-ladder.ts";
 import { parseSchemaPack } from "../../../src/core/brain/schema-pack.ts";
 import { applySchemaMutations } from "../../../src/core/brain/schema-mutate.ts";
 import {
+  lockSecretKeyfile,
   removeSecret,
   resolveSecretForExec,
   setSecret,
+  unlockSecretKeyfile,
 } from "../../../src/core/brain/secrets/store.ts";
+import { fakeCredential } from "../../helpers/fake-credentials.ts";
 import { writeSignal } from "../../../src/core/brain/signal.ts";
 import { retireSignal } from "../../../src/core/brain/signal-retire.ts";
 import { learnSkillProposals } from "../../../src/core/brain/skill-proposals.ts";
@@ -266,6 +270,12 @@ describe("the guard fires on Brain write paths", () => {
     agent: "test-agent",
     now: NOW,
   } as const;
+
+  const WRAP_PASSPHRASE = fakeCredential("guard-wrap", "-phrase-", "42");
+  const BUNDLE_PASSPHRASE = fakeCredential("guard-bundle", "-phrase-", "42");
+
+  /** The bundle the importGuard entry hands to the writer, built in the seed. */
+  let bundleForGuard: ReturnType<typeof exportSecretBundle>;
 
   const GUARD_PAGE_REL = posix.join("notes", "guard-page.md");
 
@@ -636,6 +646,48 @@ describe("the guard fires on Brain write paths", () => {
       seed: (v) => void setSecret(v, SECRET_INPUT),
       write: (v) =>
         void resolveSecretForExec(v, SECRET_INPUT.name, { agent: "test-agent", now: NOW }),
+    },
+    {
+      // The wrap-on-first-unlock conversion: writes the envelope over the
+      // raw keyfile and lands the unlock custody record.
+      name: "unlockSecretKeyfile",
+      seed: (v) => void setSecret(v, SECRET_INPUT),
+      write: (v) => void unlockSecretKeyfile(v, WRAP_PASSPHRASE, { agent: "test-agent", now: NOW }),
+    },
+    {
+      // lock clears the holder and lands the locked custody record; on a
+      // never-wrapped store the refusal still comes from the guard, ahead
+      // of any keyfile read.
+      name: "lockSecretKeyfile",
+      write: (v) => void lockSecretKeyfile(v, { agent: "test-agent", now: NOW }),
+    },
+    {
+      // The bundle export appends its custody record and reads ciphertext;
+      // the guard sits ahead of the first byte.
+      name: "exportSecretBundle",
+      seed: (v) => void setSecret(v, SECRET_INPUT),
+      write: (v) =>
+        void exportSecretBundle(v, BUNDLE_PASSPHRASE, { agent: "test-agent", now: NOW }),
+    },
+    {
+      // The bundle import writes entries under the store's lock and lands
+      // its custody record. The bundle itself is built in the seed, so the
+      // write's first byte is the import's, not the export's.
+      name: "importSecretBundle",
+      seed: (v) => {
+        setSecret(v, SECRET_INPUT);
+        bundleForGuard = exportSecretBundle(v, BUNDLE_PASSPHRASE, {
+          agent: "test-agent",
+          now: NOW,
+        });
+      },
+      write: (v) =>
+        void importSecretBundle(v, bundleForGuard, {
+          passphrase: BUNDLE_PASSPHRASE,
+          replace: true,
+          agent: "test-agent",
+          now: NOW,
+        }),
     },
     {
       name: "applySchemaMutations",
@@ -1016,5 +1068,101 @@ describe("bootstrap path", () => {
     const notices: DegradationNotice[] = [];
     expect(() => brainDirsForWrite(vault, notices)).not.toThrow();
     expect(notices).toHaveLength(0);
+  });
+});
+
+/**
+ * The signal-lane review gate (write-side trust, Task 6). Resolved inside
+ * `writeSignal` when the caller names no `targetDir`; `stagePendingSignal`
+ * passes one explicitly and must never re-enter the gate. The gate reads
+ * the process config path, so these cases drive it through the env twin.
+ */
+describe("writeSignal review gate", () => {
+  const GATED_INPUT = {
+    topic: "gate-topic",
+    signal: "positive",
+    agent: "test-agent",
+    principle: "stage me for review",
+    created_at: "2026-07-26T00:00:00Z",
+    date: "2026-07-26",
+    slug: "gate-topic",
+  } as const;
+
+  const MASTER_ENV = "OPEN_SECOND_BRAIN_WRITE_APPROVAL_ENABLED";
+  let savedMaster: string | undefined;
+
+  function setGate(on: boolean): void {
+    if (savedMaster === undefined) savedMaster = process.env[MASTER_ENV];
+    if (on) process.env[MASTER_ENV] = "true";
+    else delete process.env[MASTER_ENV];
+  }
+
+  afterEach(() => {
+    if (savedMaster === undefined) delete process.env[MASTER_ENV];
+    else process.env[MASTER_ENV] = savedMaster;
+    savedMaster = undefined;
+  });
+
+  test("gate off writes to the inbox with staged false", () => {
+    setGate(false);
+    const res = writeSignal(vault, GATED_INPUT);
+    expect(res.staged).toBe(false);
+    expect(res.path.startsWith(brainDirs(vault).inbox)).toBe(true);
+    expect(existsSync(brainDirs(vault).pending)).toBe(false);
+  });
+
+  test("gate on stages into Brain/pending with staged true", () => {
+    setGate(true);
+    const res = writeSignal(vault, GATED_INPUT);
+    expect(res.staged).toBe(true);
+    expect(res.path.startsWith(brainDirs(vault).pending)).toBe(true);
+    expect(readdirSync(brainDirs(vault).pending).filter((f) => f.endsWith(".md"))).toEqual([
+      `${res.id}.md`,
+    ]);
+    expect(existsSync(join(brainDirs(vault).inbox, `${res.id}.md`))).toBe(false);
+    // The gate lives below the queue: the staged document is listed by the
+    // ordinary pending listing and apply consumes it unchanged.
+    expect(listPending(vault).map((entry) => entry.id)).toEqual([res.id]);
+    const applied = applyPending(vault, res.id);
+    expect(applied.path.startsWith(brainDirs(vault).inbox)).toBe(true);
+  });
+
+  test("the staged document is byte-identical to the inbox document", () => {
+    setGate(false);
+    const direct = writeSignal(vault, { ...GATED_INPUT, slug: "byte-compare" });
+    setGate(true);
+    const staged = writeSignal(vault, { ...GATED_INPUT, slug: "byte-compare" });
+    expect(staged.id).toBe(direct.id);
+    expect(readFileSync(staged.path, "utf8")).toBe(readFileSync(direct.path, "utf8"));
+  });
+
+  test("a deduped retry under the gate reports staged false and deduped true", () => {
+    setGate(true);
+    const first = writeSignal(vault, {
+      ...GATED_INPUT,
+      slug: "dedup-under-gate",
+      idempotency_key: "gate-dedup-1",
+    });
+    expect(first.staged).toBe(true);
+    const second = writeSignal(vault, {
+      ...GATED_INPUT,
+      slug: "dedup-under-gate",
+      idempotency_key: "gate-dedup-1",
+    });
+    expect(second.deduped).toBe(true);
+    expect(second.staged).toBe(false);
+  });
+
+  test("stagePendingSignal never re-enters the gate", () => {
+    setGate(true);
+    const res = stagePendingSignal(vault, { ...GATED_INPUT, slug: "explicit-stage" });
+    // Exactly one staged document, written by the explicit path: the gate
+    // would have routed an ungated write to the same directory, but the
+    // explicit stage must not depend on (or double-fire through) it.
+    expect(res.path.startsWith(brainDirs(vault).pending)).toBe(true);
+    expect(readdirSync(brainDirs(vault).pending).filter((f) => f.endsWith(".md"))).toEqual([
+      `${res.id}.md`,
+    ]);
+    expect(existsSync(join(brainDirs(vault).inbox, `${res.id}.md`))).toBe(false);
   });
 });

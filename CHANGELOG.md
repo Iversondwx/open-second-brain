@@ -5,11 +5,118 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.77.1] - 2026-10-10
+## [1.81.0] - 2026-10-11
+
+Open Second Brain 1.81.0 is the answer-trust release: it narrows the gap between what an agent was given and what its answer can be believed on. A Stop-hook step now checks the quotations in the assistant's own answer against the note cited for them or the evidence the injection ledger actually delivered, a stated claim can name the context-pack sample it drew on and read the receipt and outcome provenance back, trusted local-file ingest keeps the source's bytes in a durable content-addressed archive instead of trusting a file to stay where it was, and a record with no session is read as no-session everywhere instead of pooling into one phantom bucket. A repair lane closes the outstanding review findings: attribute narrowing in search no longer silently excludes documents whose indexed snapshot has gone stale, and the wave's own review hardened the annotation channel, the provenance reach and the archive's write path.
+
+### Added
+
+- **Answer-time quote verification, shadow by default.** A new Stop-hook step registered after the stop-log guardrail walks the last assistant messages of the turn, finds quoted spans with the distill lane's quote helpers (imported, never forked), resolves each span's evidence - a note named in the span's context by wikilink or vault-relative path, else membership in the injection ledger's delivered notes for the phases actually running - and checks it through a pure module over five verdicts: `verified`, `not-in-note`, `source-truncated`, `note-unavailable` and `not-text`. Degradation never upgrades a verdict: a note whose body reached context truncated is matched against the prefix that was delivered, and a miss there is `source-truncated`, never `not-in-note`; a note that cannot be read is `note-unavailable`, because "we could not check" is a finding, not an all-clear. One `additionalContext` annotation per turn lists the unverified spans as flattened, capped previews; Claude Code renders it and the other registered runtimes stay silent. The step never blocks, never edits a transcript, and reads a bounded message window under character and wall-clock caps, failing open with exit 0. Configuration is per phase in the `quote_check` block of `Brain/_brain.yaml` - `recall`, `active` and `subagent`, each `off|shadow|enforce`, default `shadow` (annotate-only), scoped to the phases whose injection the vault enabled - and `enforce` additionally appends exactly one Brain-log `note` event per turn carrying the counts and the finding lines, so findings survive the session.
+- **Statement-level claim attribution.** `brain_truth state` and `o2b brain truth state` accept an optional opaque `sample_id` (CLI `--sample-id`) frozen on the committed claim event - schema version unchanged, omitted when absent, never invented - and claim reads hydrate the provenance behind it: the named context receipt's items plus the context-pack outcome row, joined read-only, one ledger read per report. Provenance is shaped by the caller's reach - below local reach, receipt items whose injections came from operator rules and item paths the caller cannot read stay hidden, so a claim's `sample_id` never leaks what the receipts surface refuses to say directly - and the join is omit-don't-invent in both directions: a claim whose outcome never arrived reports "receipt known, outcome unknown", a claim timestamped before its claimed receipt is flagged as an inversion rather than silently joined, and a row without a `sample_id` renders byte-identically to before.
+- **A durable source archive behind trusted local ingest.** Ingesting a trusted local source now reads the file once and archives its bytes content-addressed at `Brain/.archives/<sha256>.txt` - redacted before persist so credentials never land in a second file, refused past a 1 MiB ceiling rather than truncated (an oversized source is simply not captured, and absence on the page still means exactly "not captured"), deduplicated by its own hash, and never TTL-pruned: evidence, not scratch. Success stamps `source_archive_hash` and `source_archive_bytes` on the summary page and returns `source_archive_hash` on the ingest result; visibility tokens hold, so a source whose digest is refused to remote readers is never archived and remote reach never reads archived bytes. The capture-scope hygiene detector names a page whose archive is missing or no longer matches its stamp, `o2b brain doctor` prints a count-only archive section (entries, bytes, missing, mismatched, uncited - no fix verb, pruning and recapture are operator calls), `brain_hygiene` gains `archive_get`, which resolves a summary page's stamp to its archived bytes at local reach only, and delete-by-source cleanup removes the source's orphaned entries best-effort.
+- **Explicit no-session identity.** A missing or non-string `session_id` is treated as no-session explicitly at every reader: scoped recall excludes the record, grouping sites skip it instead of lumping it into a shared bucket, and the session-summary digest omits the key rather than answering `""` - dissolving the phantom session that quietly collected every unattributed record from every unrelated lane. A new count-only, fail-soft doctor check, `blank-session-identity`, reports one issue per affected record kind with a count; no payload is rewritten and no repair verb ships, because the continuity store is append-only and repair belongs to a backup-gated posture.
+
+### Changed
+
+- **Docs:** `docs/cli-reference.md` documents the `truth events`/`truth state` verbs with `--sample-id` and provenance-hydrated reads, the widened capture-scope detector and the doctor's archive section; `docs/mcp.md` covers `archive_get` on `brain_hygiene`, the archive stamp on the ingest result and the claim provenance hydration; `docs/observability.md` documents the quote-check surface and the no-session rule with its doctor count; `hooks/README.md` gains the new Stop step; the README names the release and extends the claim-ledger capability.
 
 ### Fixed
 
-- **The snapshot archive no longer carries its own home.** `createSnapshot` lists the top-level `Brain/` entries with `readdirSync(dir, { encoding: "buffer" })` and drops the ones `BRAIN_SNAPSHOT_EXCLUDED_ENTRIES` names, so `.snapshots` and `.artifacts` are never archived. On Bun that call returns a `Uint8Array`, not a `Buffer`, and `Uint8Array.prototype.toString()` renders comma-joined byte values (`"46,100,..."`) rather than the name, so every comparison missed and the exclusion never fired. Both entries were therefore packed into each archive: `.artifacts` churn, and `.snapshots` the archive home itself, which made every snapshot carry its predecessors and grow without bound. Dream snapshots doubled daily from single-digit megabytes to gigabytes until the run exceeded its timeout and died mid-write, leaving partial archives behind. One `bufferEntryName` helper decodes either shape and the filter uses it; the members are unchanged otherwise. A test asserts the archive carries neither excluded entry.
+- **A stale attribute snapshot no longer silently excludes a document from search.** The property pushdown narrowed the candidate pool against the indexed `document_attributes` snapshot while advertising the live file as the final judge, so a document whose indexed snapshot no longer matched its file - a draft flipped to done - dropped out of a `status=done` query before the live post-rank filter ever saw it. A store-level freshness gate now compares a candidate's indexed snapshot against the live document during narrowing: a proven-fresh candidate keeps its SQL exclusion without touching the filesystem, a stale one falls through to the lane read without the exclusion fragment and is judged by the live filter, and absent filters still compile byte-identical SQL.
+- **Review hardening across the wave.** The external reviews of this wave hardened what landed: the annotation's findings render as flattened previews under a character cap, the cited-note read is bounded and the transcript tail-window read advances in pages instead of scanning whole files, the archive stats path resolves its root through the containment check before it stats anything, and the archive stamp's single-writer assumption is pinned as an architecture census beside the claim-attribution one.
+- **Two damaged CHANGELOG entries read as written again.** Whitespace that had collapsed inside the v1.72.0 cost entry (words running together around `estimated_cost_usd` and `search status`) and the v1.19.0 post-compact-audit block (a lost indent) is repaired; prose only, no claim changed.
+
+## [1.80.0] - 2026-10-11
+
+Open Second Brain 1.80.0 raises what recall can reach and what the store can answer for itself, on both ends of the pipeline: what enters the graph is gated by what the vault itself has learned, and what the store can filter is answered by the index instead of by per-row file reads. Entity creation consults a store-learned lexicon with two new structural verdicts, session imports mine precision mentions into a hallways graph an operator reviews before anything is promoted, the search store's v14 migration pushes `kind` and promoted frontmatter keys into SQL on both lanes and hydrates in two tiers, the rerank eval reports per language, and recall telemetry names its dead weight. A repair lane closes every outstanding operator-review finding from the two previous release reviews, and two release-note claims those reviews falsified are corrected here.
+
+### Added
+
+- **A store-learned entity lexicon behind the admission gate.** `o2b brain entity lexicon rebuild [--apply]` folds the vault's own pages (vault user pages only - the Brain root and session transcripts are excluded, and the artifact header binds that scope) into `Brain/entities/lexicon.json`: schema-versioned, dataset-hashed, written through one shared derived-artifact helper, and fail-open - a stale, torn or expired artifact reads as absent, so admission degrades to the previous structural behavior and never mis-rejects. No word list ships with the binary; the vocabulary is the vault's own.
+- **Two tightened creation verdicts, advisory after admission.** Entity creation (`upsertEntity`, the one choke point every minter shares) now refuses a multi-token all-caps label with no prior stored occurrence (`shouted-heading`) and a caseful label whose every token the lexicon learned as a common word (`function-word-run`), while structural code shapes (a `_`, `.`, `/`, a digit, or internal uppercase - the symbols the session miner exists for) bypass both case rules, and caseless-script labels admit on the structural gate alone. The verdicts feed the existing heal triangle - the doctor's `entity-label-malformed` findings and the snapshot-gated, dry-run-default `o2b brain entity prune` - so already-admitted records are repair candidates, never auto-removed, and anchoring (`buildAnchorables`, `anchorEntityForms`) resolves the same handle so junk forms stop anchoring facts.
+- **Session hallways.** Session import mines a precision-mention side ledger - code symbols from spans, fences and qualified-identifier shapes, URLs, file paths in both slash directions, qualified identifiers - refusing secret-shaped tokens outright and deduplicating at `(family, key, session)` granularity with provenance keyed on the transcript basename, never a host absolute path. `o2b brain hallways mine|show|promote|dismiss` folds that ledger into pairwise-PMI associations written to `Brain/link-graph/hallways.json` beside, never merged into, the vault-derived co-occurrence graph, with a reviewable proposals file and cross-run dismissals. Mining itself never writes an entity: `promote` is the only bridge into the registry, offered solely for keys seen in at least N distinct sessions (`--min-sessions`, default 3), and a promoted label still answers to the tightened admission gate.
+- **The v14 store migration.** One crash-safe first-open transaction adds a virtual generated `chunks.chunk_kind` column (`page` for chunk 0, else `section`) with taxonomy indexes, a bounded `document_attributes` side table backfilled from chunk 0 (64 keys per document, 16 values per key, 256 bytes per value; overflow decrements the set and never fails the index; the promoted keys are skipped, so none of them gains a second source of truth), and sargable path-prefix predicates (`path >= prefix AND path < prefix || U+FFFF` over the canonical POSIX spelling, which also fixes a latent Windows backslash prefix mismatch). The migration never rewrites the embedding tables.
+- **Kind and property filter pushdown on the query path.** A `kind` filter (`page`/`section`, MCP argument and CLI `--kind`) pushes into the SQL of both lanes - before `ORDER BY`/`LIMIT` on the keyword lane, inside the overfetch window on the semantic lane - and the promoted frontmatter keys compile to SQL against their dedicated indexed storage where the push is faithful to the live filter's verdict: `type` pushes the scalar declared values as the one normalized token the index stores, `pinned` pushes only for `true`, and `visibility` pushes its normalized tokens. `tags` and every non-scalar shape stay post-rank filters judged against the live file, because the indexed tag corpus and a single token column cannot answer for what the frontmatter array says. Other property keys narrow the candidate pool in SQL against the bounded `document_attributes` snapshot - only a provable mismatch drops out, since the bounded table can be silent about an over-bound document - and the live filter still judges every surfaced row, so answers stay identical to the post-rank filter alone while a filtered query hydrates and reranks fewer candidates. Pushed filters answer AS INDEXED, a documented divergence from the file on disk, and absent filters compile byte-identical SQL.
+- **A two-tier hydration cut.** The candidate pool hydrates metadata only; content hydrates for the rank cap after assembly, with final results byte-identical and peak hydration bounded by the rank cap rather than the pool.
+- **Per-language rerank eval.** Benchmark dataset queries may carry a `lang` field (default `en`, validated like `answer`), and `o2b search rerank-eval` reports a per-language split beside the overall aggregates, each language folded with the same reduce over its per-query rows, so a bilingual dataset shows per-script lifts the blended number would average away. A bundled self-authored ZH fixture (separate from the untouched EN fixture, whose denominators and pins are preserved) gates Chinese tokenization, indexing and rerank ordering in CI on the offline stack.
+- **The dead-weight telemetry view.** `brain_recall_telemetry` grows a seventh operation, `dead_weight` (CLI `o2b brain recall-telemetry dead-weight`), reporting pages currently in scope that no recorded recall within the telemetry window ever surfaced. The denominator is the vault walk's included paths - current on-disk truth, never the stale document table - so a deleted-but-indexed page is never reported; the retrieved set is the union of recorded recall artifacts and observed-use references, `since`/`until`-windowed; the payload carries the window, the counts, a capped dead list behind the usual `vault_path` envelope, and the gate caveat: telemetry is opt-in and records only surfaced top rows, so the report claims "no recorded retrieval surface within telemetry history", never absolute never. No new MCP tool - the tool-count pin holds.
+
+### Changed
+
+- **Permission-rule targets canonicalize.** A rule target written with backslashes or `.\\` segments (`Notes\a.md`) matches the stored POSIX spelling via the same path canonicalization the write paths use, and an unnormalized target in the document draws a warning, so a Windows-spelled rule no longer silently matches nothing.
+- **Custody-flow documentation.** The unlock flow prints an export-before-wrap nudge (a wrapped store's entries are unreachable to `secret export` until the keyfile is unwrapped), and the ingest-manifest documentation states that the schema-3 content-manifest move is one-way for older binaries.
+- **Bundle allowlists warn on `*`.** Importing a bundle whose exec allowlist contains the wildcard emits a named warning - an allow-everything allowlist is almost never what an operator meant - while bundle authentication (AAD) still refuses tampering, and non-wildcard allowlists behave exactly as before.
+- **Docs:** `docs/cli-reference.md` documents the hallways verb, the lexicon rebuild, the dead-weight verb and a kind-and-property-pushdown section stating the as-indexed semantics; `docs/mcp.md` covers the `kind` argument, the promoted-key pushdown and the `dead_weight` operation; `docs/observability.md` documents the dead-weight fold; the README names the release.
+
+### Fixed
+
+- **A staged ingest no longer registers itself as done.** On a `stage` verdict the ingest staged only the summary page while publishing the rest of the write's records: the intake's created entity pages landed straight in the canonical registry and the manifest row recorded the source as ingested current - so review approved half of what had already happened, and an operator rejection left a manifest claiming a done ingest no re-ingest would redo. The intake's disposition contract now covers every page and registration row of the write: created entity pages stage into the review queue beside the summary page (staged first, removed from the canonical tree second, so a crash leaves both copies and never a lost one), and the manifest row stays unrecorded until a publish arm lands. The deny arm still refuses before any write, and the update arm is untouched - the review boundary is entry, not mutation.
+- **`delete_by_source` and schema mutations consult the permissions document.** A confirmed source cleanup destroyed the derived entries and the ingest manifest entry with no document consult, and a schema batch reshaped the vocabulary every later write validates against, so a caller a document had closed could still do both. Both lanes now resolve the document against the credential subject and refuse on deny through the same discipline as update and append - the same typed refusal, one decision-ledger row, before anything is read for destruction or written; the dry-run preview stays a read and stays ungated, an absent document changes nothing, and the store-integrity doctor's `deny-consulted-lanes` finding names all the covered lanes. This entry also corrects two stale release-note claims the repairs falsified: v1.79.0's "denied agents cannot update or append to published notes" named the first two consult lanes only (delete_by_source and the schema-mutation lane were uncovered until now), and v1.78.0's research-pool claim ("research names the refusal instead of quietly yielding an empty pool") described a use site that had not been wired to the vault-resolved configuration - what ships here is the ownership measurement behind install and onboarding: it resolves a `$secret:` reference through the vault's own configuration by metadata alone, never a decrypt, so a raw reference no longer counts as a configured key, an unresolved one is reported unchecked with a reason naming it, and a store the process cannot read (locked, or missing its keyfile) reads as unchecked instead of aborting the statement; the research call site itself is not wired to the vault-resolved configuration yet, so that claim is not yet true on the live research path.
+
+## [1.79.0] - 2026-10-10
+
+Open Second Brain 1.79.0 gives an operator who lets agents write into a vault the answers the write paths never recorded: who made a given write, what rule allowed or refused it, and how to stop the next one. Agents authenticate as themselves through named per-agent MCP tokens, one operator-edited permissions document resolves allow/ask/deny at a single chokepoint, a queryable decision ledger records which rule decided, every gated write stages into a review queue that recall cannot see until an operator applies it, an owner-write gate keeps callers from publishing under a foreign owner, open questions get a durable artifact of their own, and the ambient extraction lane answers to operator consent and a time-to-live. The default posture is byte-identity: no tokens, no document, no gate keys and no flags means every existing write path behaves exactly as before.
+
+### Added
+
+- **Named per-agent MCP tokens, hash at rest.** `o2b mcp token mint|rotate|revoke|list` manages one token per agent in `.open-second-brain/secrets/mcp-tokens.json` beside the custody store: the store keeps only the sha-256 hash of the material plus a non-secret prefix, verification compares hashes in constant time, the plaintext material is printed exactly once with a shown-once notice and never persisted, writes serialize under the secrets lock, names use the `mcp_token_<slug>` spelling the `$secret:` grammar can address, and every mint, rotation and revocation appends a no-values custody audit record.
+- **Token authentication and request-scoped identity on the HTTP transport.** A request whose credential matches a stored token authenticates as that token's agent for that one request - identity threads as a parameter through the dispatch path, never as server state, so concurrent callers with different tokens never observe each other's identity. The token map is consulted before the shared key, the shared `--api-key` stays valid as the operator master credential with the process's configured identity, and a revoked or unknown token gets the same generic `401` body as a missing credential, so no oracle distinguishes them. Rotation and revocation take effect on the next request with no server restart. The new `mcp_tokens_required` device key (default `false`, env twin `OPEN_SECOND_BRAIN_MCP_TOKENS_REQUIRED`) makes the endpoint refuse credential-less requests while a non-empty token map exists; the non-loopback bind rule accepts a key or a non-empty token map, and stdio identity stays config-derived. A token mints identity only, never reach.
+- **One bootstrap command.** `o2b bootstrap --target <harness>` runs the harness adapter's existing idempotent apply, optionally mints and prints the harness token once (`--token`, never on argv and never in a harness config), and writes a receipt at `<vault>/.open-second-brain/bootstrap.lock.json` recording the owned entries, the token name and prefix, and the applied time. A second identical run is a byte-identical no-op, `--rotate` re-mints under the same name and reprints once with the new material authenticating on the next request, `--check` verifies drift, and unsupported targets are refused naming the available list. The config-writing adapters (codex, grok, opencode) apply directly, `generic` prints the payload plus manual steps, and the plugin runtimes stay verify-only.
+- **One permissions document.** `Brain/_permissions.yaml` - an operator-edited vault file that rides vault sync like the freeze marker - resolves `allow`/`ask`/`deny` per agent, operator-defined role and target-scoped entry for the `write`, `ingest` and `owner_write` actions. The loader is strict: `default_action` is required, unknown keys warn, a `version` other than 1 hard-refuses naming the file, and a present-but-unreadable document fails closed with a field-named error instead of falling back to permissive. Resolution order is target entry, then agent override, then role, then default, with deny over ask over allow at equal specificity; when a document exists it is the only disposition source, so one write has exactly one deciding rule. With the file absent every check behaves exactly as today.
+- **A queryable decision ledger.** Every ask/deny verdict plus the owner-write gate's warn rows lands as one JSONL row in the month/device shards under `Brain/logs/decisions/`, carrying `actor`, `via`, `action`, `target`, `verdict`, the deciding `source` (entry, agent, role, default or gate key), the reason token and optional `tool` and `correlation_id`; allow rows are written only when the document asks for them (`ledger.record_allows: true`). The append never throws - a failed write returns an audit reason for the caller to surface instead of blocking the verdict it records. `o2b brain permissions show` prints the effective document plus a dry-run decision table over the declared agents, `ledger` reads the filtered rows, and `o2b brain doctor` reports an unreadable document as the `permissions-unreadable` finding with the show verb as the exit.
+- **Staged review for every writer lane.** Beyond the existing signals queue, note creates stage at `Brain/pending/notes/<id>.md` (the id carrying a reversible percent-encoding of the publish target, round-trip safe over CJK, spaces and dots, over-long targets refused by name) and ingest summary pages stage at `Brain/pending/ingest/`, while registration completes and cleanup removes the staged page. The signal gate now resolves inside `writeSignal`, so every ungated caller - MCP and CLI feedback, inline scan, session import, lifecycle and checkpoint - inherits it without per-tool wiring; batch create ops stage per operation and report receipt status `staged` with a `pending_id`, and staged receipts on the writer tools carry the next command `o2b brain pending apply <pending-id>`. `o2b brain pending list` shows every lane sorted with `--lane` filtering and named-unreadable entries, apply is an exclusive create with a typed conflict on an occupied target, and `--dry-run` runs every check and writes nothing. Toggles are per lane: `write_approval.notes` and `write_approval.ingest` each fall back to the `write_approval.enabled` master (default off) when absent.
+- **Staged documents leave recall.** `Brain/pending/` is excluded from search-index admission (reason `review-pending`), so `brain_search` and recall-inject cannot surface a document no operator has admitted, while gate-off vaults without a pending directory are unaffected.
+- **The owner-write gate.** `integrity.owner_scope_writes` (`off` | `warn` | `fail`, default `off`, unreadable config fails closed to `fail`) refuses a caller-named owner that differs from the caller's resolved identity: on the preference lane at the explicit-owner arm, and on the note lane where `owner` joins the refused frontmatter keys for creates and batch updates under `fail`. The refusal carries the `owner-write-refused` token (`owner_write_refused` on the write-batch and note-creation error vocabularies) naming both the named and the resolved owner and the fix - name your own identity or omit the owner. `warn` allows and appends exactly one decision-ledger row carrying the gate key as its source, and a document's `owner_write` verdict composes most-restrictive-wins with the gate in both directions. Gate off, behavior is byte-identical.
+- **Open decisions.** `o2b brain decision open --title <t> --question <q> --option <o> [--option <o>...] [--context <c>]` parks a question with enumerated options at `Brain/decisions/open-<slug>.md` - a frozen key table, JSON-quoted free text, a `## Question`/`## Options`/`## Context` body, a directory lock around transitions, and a typed duplicate refusal naming the existing id. `list_open` partitions by status with unreadable records named, `show_open` reads one back, `resolve <id> --choice <c>` mints the real `type: decision` page through the ordinary record path and stamps the open record `resolved` with a `[[decision-<slug>]]` pointer plus exactly one `open-resolved` receipt, and `discard <id> --reason <r>` closes without deciding. Terminal records stay in place, the morning brief renders at most five open records plus an unreadable block and never mutates them, and the `decision-open`, `decision-resolved` and `decision-discarded` log kinds keep the lifecycle in the Brain log timeline.
+- **Consent and a TTL for ambient capture.** `guardrails.ambient_writeback: false` suppresses the ambient extraction lane with a counted, logged `ambient-withheld` event per capture and no signal written (absent keeps today's behavior, since the lane already writes on capture); `guardrails.ambient_ttl_days` stamps `expiration_date` at creation on ambient-extracted signals, which the expiration filter then drops at read. A TTL-stamped signal still stages when the review gate is on, and the expiration survives apply verbatim.
+
+### Changed
+
+- **Document-backed dispositions close the `force_confirmed` gap.** With a permissions document present, `force_confirmed` writes a confirmed preference only when the caller's `write` verdict resolves to `allow`; otherwise the refusal answers with the `force-confirmed-requires-allow` token and the `o2b brain permissions show` exit, and document-absent behavior is unchanged. A document `deny` refuses the write before any filesystem effect with the typed `write-refused` error naming the principal, the action, the deciding rule and the next command, the lane keys cannot bypass a document in either direction, and each stage or refuse disposition appends exactly one ledger row naming the rule that decided.
+- **Docs:** `docs/cli-reference.md` documents `o2b bootstrap`, `o2b mcp token`, `o2b brain permissions`, the widened `o2b brain pending` and the open-decision actions; `docs/mcp.md` documents the per-agent token authentication, the new refusal tokens with their next commands and the open-decision actions on `brain_decision` (no new MCP tool - the advertised surface is unchanged); `docs/observability.md` gains the decision-ledger section and the new Brain log kinds; the README control section states every new gate with its config key and default-off posture.
+
+### Fixed
+
+- **The passphrase-wrapped store is reachable again.** Every key-bearing verb (`set`, `rm`, `run`, `export`, `import`) ingests the passphrase through `--passphrase-from-env` or stdin exactly as `unlock` does; the MCP server unlocks once from `OPEN_SECOND_BRAIN_SECRETS_PASSPHRASE` at its first key use and drops the variable; `o2b brain secret unwrap` restores the raw keyfile; and the wrap path verifies the envelope against the key and writes it durably before replacing the only copy, and a failed post-write restore reports the original read-back refusal beside a named warning instead of the restore's own error.
+- **Credential bundles authenticate their metadata.** Each entry's value is sealed against its name, env mapping, allow patterns, the bundle version and the KDF parameters, so an edited or swapped bundle refuses on import before any write; the bundle schema moves to 2 and older bundles refuse naming the re-export remedy.
+- **Approval digests bind the content that lands.** The import plan seals each row's source and rendered-body hashes, so a file edited after the dry run fails the apply; `brain upgrade --apply` accepts `--approval-digest`, required when non-interactive and verified against the freshly computed plan.
+- **The ingest manifest carries the extraction contract per entry.** Ingesting one source no longer cancels the owed reprocess of the others; a manifest without per-entry contracts degrades toward reprocessing, never toward skipping.
+- **Tags accept the Obsidian grammar.** Unicode letters and digit-led tags (`2fa`, `2024-notes`) pass; only bare numbers refuse; legacy scopes carrying such tags stop breaking dream rewrites and preference writes.
+- **A refused capture no longer crash-loops the Telegram daemon.** Contract refusals are recorded per update, the offset advances, and the run continues with the messages behind the refusal.
+- **Session-summary divergence is a signal again.** Records dedupe by content hash on read, `divergent` fires only when distinct hashes coexist at one instant, and the revision count is reported separately.
+- **Secret references resolve the names the store holds.** Hyphenated and mixed-case names resolve through the store leg while the env fallback keeps its case rules, and redaction covers env-resolved values without blanking error text on one- or two-character values.
+- **The HTTP transport survives a corrupt token store.** A store read error falls through to the shared-key compare with a named warning, while token enforcement that was requested by config stays on (an unreadable map refuses credential-less requests rather than reading as empty); a presented credential matching nothing is refused outright rather than read as anonymous; and revoking the last token on a keyless network bind no longer re-opens anonymous access.
+- **Request identity reaches every write decision.** A token caller's writes are judged as the token's agent: document deny entries refuse them, cross-owner claims are checked against the credential identity, a caller-supplied agent that differs from the token refuses by name, and the decision ledger names the true actor. A run launched with an explicit config path is consulted as the agent that config declares even when no transport identity is present, so a document rule naming that agent refuses it and the ledger row names it. The signal lane consults the permissions document like every other writer, denied agents cannot update or append to published notes, and the review door appends one resolution row per apply and reject.
+- **Staging the same target twice refuses by name** instead of silently replacing the earlier entry's bytes - and the retried `brain_create_note`, `brain_write_batch` create op or `brain_ingest_source` answers the `pending-stage-conflict` code carrying the queue entry that holds the target, not a generic internal error - and a failed decision-ledger append surfaces its audit reason instead of vanishing.
+- **Open decisions stay resolvable.** Same-titled questions resolve into distinct decision pages even when the title's slug fills the 64-character cap - the per-record fallback candidates keep their distinguishing id inside the cap, so resolving one never spins forever against a foreign page at that slug - a resolved or discarded question can be parked again with the same wording, adversarial headings in question text round-trip byte-faithfully, callers below the record's reach cannot resolve or discard what they cannot list, and the CLI help says non-Latin titles hash to an unnamed id.
+- **Bootstrap tells the truth about tokens.** The minted token authenticates hand-configured HTTP clients while the registered harness keeps its config-derived identity (stated in the output and the docs); a failure anywhere in the registration half - the payload build refusing, the apply throwing - no longer loses the minted material; placeholder agent names refuse at mint; rotation keeps a ten-minute grace window for the previous material; and `o2b bootstrap --remove` tears a provisioning down through the receipt.
+- **The doctor sees a document that denies the locally configured agent**, and sessions import reports the ambient-withheld count when consent suppresses capture.
+- **Expired transient facts cannot consolidate.** The dream topic and promotion planning readers drop signals past their ambient time-to-live before clustering, matching the recall path.
+
+## [1.78.0] - 2026-10-09
+
+Open Second Brain now puts credential custody under an operator passphrase and routes it by name: the vault's secrets keyfile wraps into an opt-in scrypt envelope behind a lock/unlock lifecycle, `$secret:NAME` references resolve through the custody store at every credential use site, one passphrase-encrypted bundle moves the store between installs, and every resolved credential literal is redacted at the error and config-mapping boundaries. The vault's own declarations bind its writers - composed tags must parse as Obsidian tags and a declared page vocabulary gates capture writes - and the plans an operator approves are sealed: a Claude-memory import or a brain upgrade applies exactly the approved plan or nothing. Reads name divergent session summaries, the model-answer verbs strip and name a leading think block before parsing, and a changed extraction contract reprocesses the sources it covers instead of absorbing the change as unchanged.
+
+### Added
+
+- **A passphrase-wrapped keyfile with a lock/unlock lifecycle.** `o2b brain secret unlock` wraps the store's raw 32-byte keyfile in place under a passphrase - read from stdin or `--passphrase-from-env`, never argv - into a versioned scrypt envelope (per-envelope random salt, parameters bounded to the build's cost curve) and holds the unwrapped key in memory for that one process only; `lock` clears the holder and refuses a store that was never wrapped by name, instead of recording a protection that does not exist. There is no daemon: every other invocation and the MCP server stay locked, a key-bearing operation over a locked store refuses with a named error whose prose carries no paths and whose remedy is the unlock command, and a store that still holds entries but has lost its keyfile refuses the read-only resolve by name instead of minting a fresh key over the surviving ciphertext. Both lifecycle verbs land no-values custody records and sit behind vault identity, and the help and manifest state the loss warning: a lost passphrase is unrecoverable, and every stored value stays unreadable forever.
+- **Passphrase-encrypted credential bundles.** `o2b brain secret export --out FILE` re-encrypts every entry under a key the passphrase derives through the envelope KDF (fresh salt, the parameters recorded inside the bundle) and writes one file an operator can carry between installs - names, env-var mappings and allow patterns travel in the clear past the shared egress redactor, the values do not. `secret import FILE` verifies and decrypts every value before writing anything, reuses the store's own name, env-var and allow-pattern validation, and refuses a name the store already holds unless `--replace`; both operations land no-values custody records and run behind vault identity.
+- **`$secret:NAME` references resolve at the use sites.** The custody-store-backed named-secret provider answers credential consumers store-first with environment fallback - byte-identical when no reference is used, opt-in via the vault that joins the store: the embedding registry's provider probes, the decision-model key from config resolution through the provider factory (extract pre-filter, labels, recall-inject, skills, rerank), the research pool env, the Telegram capture token and the installation secret behind the `vault_path` MCP field. A locked store or an unresolvable reference surfaces the named refusal - the decision-model key degrades into errors with no request leaving, the Telegram run fails naming the secret instead of handing the raw reference to the API, research names the refusal instead of quietly yielding an empty pool - and resolution stays read-only: no `last_used_at` stamp, no exec custody record, no store mutation. `o2b secrets list` and `status` accept `--vault <path>` and report availability from the merged provider, metadata only, a locked store still counting.
+- **Resolved credential literals are redacted at the guarded boundaries.** The MCP error boundary scrubs every occurrence of a value the vault resolved from a reference - longest value first, ahead of the truncation guard, so no cut leaves a partial credential - and the OpenClaw status tool's config mapping takes the same values into its scan; a boundary whose store is absent, empty, unreadable or locked contributes nothing and answers byte-identically to the shape-only redactor.
+- **Digest-sealed approval for import and upgrade plans.** `o2b brain import-claude-memory --dry-run` seals the adoption plan - plans, skipped entries, conflicts, unchanged rows, no wall-clock fields - and prints its digest; a non-interactive `--apply` must carry `--approval-digest` (exit 2 otherwise, mirroring the `--yes` guard, while an interactive terminal keeps the escape hatch) and lands exactly the approved plan or nothing: a stale digest refuses naming approved and current digests and stating that nothing was written, and a digest paired with `--dry-run` refuses, because a dry run computes one and does not consume one. `o2b brain upgrade` seals its plan the same way and verifies the seal first at apply, so a plan object edited after it was measured is refused before the error rows, the no-op return or the snapshot; the CLI and the self-heal worker, which apply the plan they just planned, are unchanged.
+- **Divergent session summaries are named on reads.** The single-session read (CLI and MCP) answers the latest digest plus `digest_count`, and when one session id holds several content-differing digests reports `divergent: true` beside a bounded newest-first-count, oldest-first sample of `id` / `created_at` / `content_hash` rows - never a payload echo. Divergence is reported, never merged, deleted or reconciled.
+- **A named think-block strip before CLI JSON parses.** The four model-answer verbs (extract-signals, design-note, skill-proposals page-draft, distill) parse plainly first and, on failure, strip one leading `<think>...</think>` block and retry; every strip is named on the result - a note on the ok envelope under `--json`, a note line in text - and a payload that still refuses keeps the named exit-1 refusal with the attempt named. Clean JSON is byte-identical and genuinely malformed JSON is never rescued.
+- **The extraction contract fingerprint rides in the source-ingest manifest.** The manifest records the fingerprint of the extraction contract (the schema-extractable allowlist plus the hand-bumped contract version), schema 2 with a v1 read path, and batch planning compares it against the live one: on a mismatch - a v1 manifest with no recorded contract included - byte-identical sources reprocess once under the distinct contract-changed status (`contract_changed` and `contract_changed_files` on the wire, an info line in text) instead of being absorbed as unchanged, reconcile names those sources as the gap, and the fingerprint folds into the plan id so a stale checkpoint cannot resume-skip work extracted under a different contract.
+
+### Changed
+
+- **Composed tags must parse as Obsidian tags.** Every tag the core composes into frontmatter - a preference's topic, scope and extra tags, a signal's topic and scope, the Claude-memory import's derived topic and scope - is validated against the one rule the search index and the inline detector already read (starts with a letter or underscore, continues with letters, digits, dashes, underscores or slashes, never purely numeric), and a segment that fails it refuses the write with the offending field and the rule named. Existing content cannot be refused retroactively, so an opt-in `frontmatter-tags` hygiene detector reports what the write-time gate would have rejected - one finding class, grouped per distinct value, informational, never auto-fixed.
+- **A declared page vocabulary gates capture writes.** A vault that declares `schema.page_types` in `Brain/_brain.yaml` refuses a capture whose kind it does not declare - staged captures, every inbox-drain route and the Telegram path - with a typed error naming the kind, the declared set and the remedy, before any filesystem effect: no directory is created and no allocator name is consumed. The idea route consults the gate at plan time, so a dry run previews the same refusal apply would land, and a vault with no declaration behaves byte-identically to before.
+- **Docs:** `docs/cli-reference.md` documents the lock/unlock/export/import verbs, the `--vault` join on `o2b secrets list`/`status`, `--approval-digest` on the import and the contract-changed batch-plan report; `docs/how-it-works.md` states the passphrase envelope, the references and the bundles under the custody model; the README names the release and the custody capability. The plugin mirrors follow.
+
+### Fixed
+
+- **Same-instant continuity records read in append order.** The store tie-broke rows sharing a timestamp by content-hash id, which says nothing about which of two same-instant writes landed first, so a latest-wins reader - the session-summary read among them - could answer the older take arbitrarily. Within one shard the append-only file is now the authority; ties across shards still order by shard id, because two devices' arrival orders genuinely cannot be known.
 
 ## [1.77.0] - 2026-10-08
 
@@ -83,6 +190,7 @@ The bundled opencode plugin loads and works on OpenCode V2 hosts from the same i
 
 - **The opencode plugin supports the V1 and V2 plugin APIs from one file.** The module now default-exports `{ id, server, setup }`: OpenCode V1 keeps calling `server()` exactly as before, and OpenCode V2 loads the same installed copy through `setup()`, which feature-detects every capability it needs (`location.directory`, `session.hook` / `get` / `context`, `tool.hook`, `event.subscribe`) and does nothing when one is missing, so hosts without a hook stay unaffected. Under V2, active-context injection rides the session `context` hook, the post-write reminder rides `tool.hook("execute.after")`, and session capture subscribes to the event stream and merges each snapshot with the earlier turns so history survives compactions; a committed revert removes the saved boundary and the turns after it, rebuilding from active context when the boundary was never captured. Verified live against opencode 2.0.24: plugin load, context hook, capture spool and post-write reminder.
 - **V2 capture listens on the turn-end events a released opencode emits.** opencode 2.0.24 never fires `session.idle`; a finished turn emits `session.execution.succeeded` (failed and interrupted runs likewise). The capture set now covers those names alongside the v2-tree names, plus `session.compaction.failed`, so a turn that ends or fails on a released V2 host still lands its spool snapshot.
+
 ## [1.74.0] - 2026-10-07
 
 Open Second Brain now defends against near-duplicate memory at the points a fact enters or leaves the vault: one reach-aware near-duplicate kernel scores the note-write receipt hint, the feedback advisory and a new retire-sibling list, so a context-driven retire names the active paraphrases that would otherwise survive it; the receipt hint can look beyond the written page's directory through the keyword index; every receipt lint finding answers at the caller's reach; extract-signals grounds time bounds in each turn's timestamp and refuses a payload that repeats a topic; and route metrics time each write stage without carrying any content.
@@ -106,6 +214,7 @@ Open Second Brain now defends against near-duplicate memory at the points a fact
 ### Fixed
 
 - **Every receipt lint finding answers at the caller's reach.** Note-write receipts used to apply the caller's reach to the near-duplicate check only; the broken-wikilink and merged-link checks now treat a withheld page as absent too, so a wikilink to it reads as broken and a merge chain ends at its first withheld hop.
+
 ## [1.73.1] - 2026-10-07
 
 Sturdier input handling in three places, and a faster CI.
@@ -836,6 +945,7 @@ Open Second Brain now runs natively on Windows 10 and 11. Until this release the
   - a drive-letter git remote parsed as a URL scheme.
 
   Each now uses `node:path` or the existing containment helpers, and each has a test.
+
 - **Snapshots failed under Git for Windows' tar.** Inside Git Bash, and on GitHub's Windows runners, the `tar` first on PATH is MSYS GNU tar, which cannot extract into a backslashed `C:\...` directory. Every path handed to tar is now written with forward slashes, which it and `System32\tar.exe` both accept.
 - **Updating a note with the Windows read-only attribute** failed with a raw EPERM after the before-image was stored. It is now refused up front as `target_unreadable`, the code POSIX already produces for EACCES.
 - **Piped stdin could be lost on Windows** (`capture`, `codec`, `secret`): the process exited before the pipe drained. It is now read through one helper that waits for EOF.
@@ -1715,8 +1825,6 @@ A context-integrity wave: ten units that convert a silent failure in the read an
 - The link-ratchet gate no longer passes on a subject that measures nothing: an empty or fully-excluded subject is an explicit unmeasurable state rather than a ceiling of zero.
 - Four source files carried literal NUL bytes that made git treat them as binary and made `grep` skip them silently.
 
-
-
 A semantic-health baselining release ([#147](https://github.com/itechmeat/open-second-brain/issues/147)): an optional acknowledge-before watermark lets an operator declare "I have seen and accepted the state up to this date", so a one-time bulk seed of preferences no longer pins the health verdict at `watch` forever through the `concept-gap` and `batch-concept-inflation` advisories. Detection and storage are unchanged; the watermark only filters which findings are surfaced, the verdict is computed from the surfaced set, and suppression is always reported explicitly. With no watermark set, every output is byte-identical to 1.37.0.
 
 ### Added
@@ -1941,8 +2049,6 @@ A retrieval and ranking quality release: embedding-layer robustness, faster and 
 
 - **Multi-key fallback for the embeddings API key.** A provider profile's `envKey` may now be an ordered probe list (a single string still works and stays byte-identical); resolution takes the first present key and the `OpenAICompatProvider` fails over to the next on an HTTP 401/403, pinning the first that authenticates. `o2b search provider add --env-key A,B` registers a probe list. Rerank stays single-key. Removes the single point of failure in the only networked path without touching the LLM-free kernel.
 - **Outcome-validated procedural recall.** Procedural entries and their usage sidecar gain additive success / failure counters (outcome-free vaults stay byte-identical), a host-supplied `recordProceduralOutcome` (deterministic, no LLM), and success-rate ranking that surfaces proven procedures and sinks failing ones, with the usage count as the neutral prior for unproven ones. Exposed via `brain_procedural_memory mark_outcome` and `list ranked:true`.
-
-
 
 ### Fixed
 
@@ -2535,8 +2641,6 @@ calls no LLM.
   fields are additive; existing `IndexStats` fields are byte-identical when no
   option changes.
 
-
-
 Memory subsystem alignment: the write paths the Hermes memory provider
 declares now match the live host memory semantics. The release makes
 pinned-context budget handling honest, adds atomic batch writes for
@@ -2676,7 +2780,7 @@ storage model stays vault-first Markdown and JSONL.
 
 - **Strongest-objection steelman in synthesis outputs.** Both the
   `osb://topic/{slug}` resource and `brain_deep_synthesis` now surface
-  the single best-formed argument *against* their own implicit
+  the single best-formed argument _against_ their own implicit
   conclusion, rather than only enumerating tensions within the source
   material. Inspired by obsidian-wiki's steelman section, adapted to
   Open Second Brain's deterministic-core contract (no generated prose —
@@ -3137,7 +3241,7 @@ storage model stays vault-first Markdown and JSONL.
 ### Added
 
 - **Native Grok Build (xAI `grok`) integration.** `o2b install --target grok
-  --apply` registers the two Open Second Brain MCP servers in
+--apply` registers the two Open Second Brain MCP servers in
   `${GROK_HOME:-~/.grok}/config.toml` under `[mcp_servers.*]` (grok's
   highest-priority MCP source) and writes lifecycle hooks to
   `${GROK_HOME:-~/.grok}/hooks/open-second-brain.json` (grok's native hooks
@@ -3207,7 +3311,7 @@ logging reminder.
 - **Bundled opencode plugin** (`plugins/opencode/open-second-brain.ts`):
   a single zero-dependency file installed into
   `~/.config/opencode/plugins/` by `o2b install --target opencode
-  --apply`. On each chat request it appends the rendered
+--apply`. On each chat request it appends the rendered
   `Brain/active.md` digest to the system prompt (via the same
   `o2b-hook active-inject` shim the Claude Code and Codex hook layers
   use, cached with a 5 minute TTL); on `session.idle` /
@@ -3268,7 +3372,7 @@ logging reminder.
   finding ids through existing primitives (preference merge, claim
   append, targeted recompile, archive-never-delete) with an audit
   record per run. New `brain_hygiene` MCP tool and `o2b brain hygiene
-  scan|apply` verbs.
+scan|apply` verbs.
 - **Advisory conflict resolution** through the shared external-command
   bridge: when the operator configures `hygiene.resolver_cmd`, contested
   truth slots get supersede / merge / flag verdicts with recorded
@@ -3297,12 +3401,11 @@ logging reminder.
 
 ### Fixed
 
-
 - **opencode install adapter targeted a file opencode does not read.**
   The adapter now merges the two Open Second Brain servers into
   `~/.config/opencode/opencode.json` under the `mcp` key using
   opencode's entry schema (`{type: "local", command: [bin, ...args],
-  environment, enabled: true}`), honouring `XDG_CONFIG_HOME`. Apply
+environment, enabled: true}`), honouring `XDG_CONFIG_HOME`. Apply
   also migrates the stale `~/.config/opencode/mcp.json` written by
   earlier releases: the two Open Second Brain keys are removed, and the
   file is deleted when nothing else remains.
@@ -3482,7 +3585,7 @@ break with a migration table in `docs/updating.md`.
   advertised list and the callable surface are the same set. Calling
   a removed name answers an INVALID_PARAMS tombstone naming the
   replacement (`brain_digest was removed in 1.0.0; call brain_brief
-  with view="digest"`). Full table in `docs/updating.md`.
+with view="digest"`). Full table in `docs/updating.md`.
 
 ### Added
 
@@ -3502,7 +3605,7 @@ break with a migration table in `docs/updating.md`.
   task results classify `timed_out`; persisted error strings cap at
   4096 bytes with an explicit marker.
 - **Staged dream pipeline.** `o2b brain dream stage | validate
-  <run-id> | apply <run-id> | discard <run-id> | list` (MCP
+<run-id> | apply <run-id> | discard <run-id> | list` (MCP
   `brain_dream` gains an `action` parameter - no new tools). Stage
   persists a reviewable bundle under `Brain/dream/staged/<run-id>/`
   (manifest with schema `o2b.dream-stage.v1`, human REPORT.md,
@@ -3780,10 +3883,10 @@ MCP tool count grows 66 -> 69.
   independent sources materialize a `value_conflict` with
   `resolution: ask_user` - never auto-resolved - while a later value
   outside the window supersedes silently. `o2b brain truth
-  ingest|slots|conflicts|aggregate|collisions|sweep` and the
+ingest|slots|conflicts|aggregate|collisions|sweep` and the
   `brain_truth` MCP tool are the operator surface.
 - **Atomic-fact decomposition and the quantity family**. `o2b brain
-  facts decompose` deterministically splits session text into discrete
+facts decompose` deterministically splits session text into discrete
   assertions via markdown structure (heading paths, list items,
   sentence boundaries with an abbreviation guard) anchored to
   canonical entities - no model calls; `--ingest` bridges
@@ -3864,7 +3967,7 @@ ranks bit-identically. MCP tool count is unchanged (66).
   and antipatterns never decay, projects ~120d, handoffs/sessions
   ~30d, notes 60d. Reinforcement is miss-driven: a query-cache hit
   returns early and records nothing. `o2b brain activation
-  status|sweep` inspects and compacts the event store
+status|sweep` inspects and compacts the event store
   (`search_activation_enabled` is the kill switch).
 - **Co-access reinforcement edges**. Documents habitually surfaced
   together gain pairwise counts in the same fold; when one appears in
@@ -3891,7 +3994,7 @@ ranks bit-identically. MCP tool count is unchanged (66).
   zero-candidate first pass (implicit-AND too strict) triggers exactly
   one broadened OR retry; recovered results carry a `second_pass`
   reason and the envelope reports `secondPass: {triggered, reason,
-  added}` (`search_two_pass_enabled` is the kill switch).
+added}` (`search_two_pass_enabled` is the kill switch).
 
 ### Changed
 
@@ -3982,8 +4085,8 @@ stays at 65 tools.
   caller-supplied sha against the full-40-hex grammar before it can
   reach git.
 - **Git history query** (`o2b brain git find [text] [--file F]
-  [--author A] [--since/--until] [--repo K]`, `o2b brain git
-  status`). Answers "why and when did this file change" and "which
+[--author A] [--since/--until] [--repo K]`, `o2b brain git
+status`). Answers "why and when did this file change" and "which
   release carried it" purely from the store - no live git on the
   query path, so the answers survive checkout deletion. A
   deterministic per-repo digest note (releases, recent commits, hot
@@ -4002,7 +4105,7 @@ stays at 65 tools.
   new regions, and fails closed (no partial rewrite) on unbalanced,
   duplicate, nested, or mismatched sentinels.
 - **Architecture docs generator** (`o2b brain architect
-  <project-path>`). A deterministic stdlib-only scanner (module
+<project-path>`). A deterministic stdlib-only scanner (module
   layout, language mix, entry points, manifest, test layout - no LLM,
   no network) renders an overview plus per-module notes under
   `Brain/projects/arch/<repo-key>/` through the region engine:
@@ -4043,7 +4146,7 @@ stays default-off.
   test). Evolution rule documented: additive fields never bump the
   version, renames/removals/semantic changes do.
 - **Lazy gated telemetry emit kernel.** One `emitGatedTelemetry(gate,
-  build)` helper now carries every gated telemetry surface
+build)` helper now carries every gated telemetry surface
   (context-pack receipts and telemetry, pre-compress, `brain_search`
   telemetry, recall-gate telemetry): with the gate off the payload
   thunk is never invoked and nothing reaches the continuity store; a
@@ -4058,14 +4161,14 @@ stays default-off.
   un-masks redacted text - the single normalization layer every
   read-side consumer shares.
 - **ATOF/ATIF trajectory export.** `o2b brain continuity export
-  --format atof|atif [--session <id>] [--month YYYY-MM]` renders the
+--format atof|atif [--session <id>] [--month YYYY-MM]` renders the
   store as standard trajectory formats: ATOF JSONL events (recall
   telemetry as `retriever` scope pairs with a marked synthetic start,
   other kinds as marks) and ATIF v1.7 documents (one per session,
   memory-layer events as `llm_call_count: 0` system steps). Read-only
   over the read-model; private records never reach an export file.
 - **Memory quality benchmark.** `o2b brain bench memory --fixture
-  <name|path>` ingests a fixture into a disposable vault inside the
+<name|path>` ingests a fixture into a disposable vault inside the
   runs directory (never the configured vault), indexes, retrieves,
   evaluates, and reports - quality (pass rate per category), latency,
   and context cost as separate families, never one collapsed score.
@@ -4107,7 +4210,7 @@ behaviour-changing pieces are off by default or per-call explicit.
   beside the config; malformed pointers and dangling targets fail soft
   and are reported, never thrown.
 - **Read-only recall sources.** `o2b brain source add <vault> --alias
-  <name>` attaches an external vault as a read-only recall origin of
+<name>` attaches an external vault as a read-only recall origin of
   the active Brain. The registry is keyed by owning vault (switching
   profiles never leaks sources), validation concentrates in one place
   (alias and path uniqueness, self-links, direct circular links), and
@@ -4125,25 +4228,25 @@ behaviour-changing pieces are off by default or per-call explicit.
   key selects `preserve` (default, byte-identical), `full`
   (vault-relative key path), or `short` (shortest unambiguous suffix)
   for generated and normalized links. `o2b brain links normalize
-  [path] [--mode M] [--write]` rewrites wikilinks across Brain notes -
+[path] [--mode M] [--write]` rewrites wikilinks across Brain notes -
   dry-run by default, decorations and code blocks preserved verbatim,
   ambiguous and unknown targets left as typed and reported.
 - **Shell-native Brain surface.** `o2b brain profile` materializes a
   compact `Brain/profile.md` digest (facts, top preferences, recent
   activity; age-gated regeneration) plus a `.o2bfs` root marker so
   shell wrappers can detect a Brain root safely. `o2b brain sgrep
-  <query> [path]` is a grep-shaped semantic search - `path:line:`
+<query> [path]` is a grep-shaped semantic search - `path:line:`
   output lines, path scoping, `--json`, exit 1 on no matches - with no
   MCP and no OSB-specific knowledge required.
 - **Grounded trigger queue with anti-nag lifecycle.** `o2b brain
-  trigger scan` turns existing semantic-health and retention findings
+trigger scan` turns existing semantic-health and retention findings
   into Markdown trigger records under `Brain/triggers/` (urgency,
   reason, suggested action, source artifacts, context snippets).
   Stable cooldown keys make repeated scans idempotent: an open twin
   blocks recreation, a dismissed/acted twin blocks for
   `trigger_cooldown_days` (default 7), an expired twin allows.
   Lifecycle is a strict machine (`pending → delivered → acknowledged →
-  acted`, dismiss from any open state) over `list`, `ack`, `dismiss`,
+acted`, dismiss from any open state) over `list`, `ack`, `dismiss`,
   `act`, and `history` verbs plus one consolidated `brain_trigger` MCP
   tool. The morning brief surfaces capped pending triggers and marks
   them delivered, so the same prompt shows at most once per cooldown
@@ -4218,7 +4321,7 @@ behaviour-changing pieces are off by default.
   Absent captures every role; an explicit flag wins; an unknown role
   fails fast.
 - **Session-scoped search focus.** `o2b search focus set|status|clear
-  --session <id>` binds a focus to one session's file under
+--session <id>` binds a focus to one session's file under
   `search-focus/` beside the global file; a bound session focus wins
   over the global one, `brain_search` gains an optional
   `focus_session` input, and SessionEnd lifecycle capture auto-clears
@@ -4226,13 +4329,13 @@ behaviour-changing pieces are off by default.
   (default off), `brain_context_pack` promotes focus-matching memories
   within their tier.
 - **Operator-readable handoff notes.** `o2b brain handoff
-  <session-file>` (and, when `session_handoff` is true, SessionEnd
+<session-file>` (and, when `session_handoff` is true, SessionEnd
   lifecycle capture) writes `Brain/handoffs/<date>-<scope>.md` with
   request, completed work, changed files, learned context, and next
   steps - extracted by deterministic regex from the recorded turns, no
   LLM.
 - **Scoped current-intention chains.** `o2b brain intention
-  set|show|list|move` (and the consolidated `brain_intention` MCP
+set|show|list|move` (and the consolidated `brain_intention` MCP
   tool) maintain per-workstream now-documents at
   `Brain/intentions/<scope>.md`: every update bumps `version` and
   appends the superseded text to an in-file history trail; `move`
@@ -4253,8 +4356,7 @@ off-by-default where they could change behaviour.
 - **Offline local embedder.** A new `local` embedding provider produces
   deterministic vectors with no cloud call, no API key, and no model
   download: token unigrams and character trigrams are feature-hashed
-  (FNV-1a, signed buckets) into a configurable fixed dimension (default
-  256) and unit-normalised, so the existing cosine ranker math is
+  (FNV-1a, signed buckets) into a configurable fixed dimension (default 256) and unit-normalised, so the existing cosine ranker math is
   unchanged. Set `embedding_provider: local` (and
   `search_semantic_enabled: true`) for a privacy-first, no-cloud recall
   path; both indexing and query embedding run without a key. It is a
@@ -4262,7 +4364,7 @@ off-by-default where they could change behaviour.
   semantic depth.
 - **CLI provider registry.** Register OpenAI-compatible embedding
   endpoints at runtime with `o2b search provider add | list | show |
-  remove`, persisted to `Brain/search/embedding-providers.json` (base
+remove`, persisted to `Brain/search/embedding-providers.json` (base
   URL, default model, and the NAME of the environment variable holding
   the key - never the key itself, so the file is safe to sync). A
   registered name resolves to `openai-compat` config during config
@@ -4304,7 +4406,7 @@ anchors.
   `category`, `name`, `aliases`, `status`, lifecycle stamps). The identity
   index rebuilds from the Markdown files on every read - nothing to persist,
   nothing to sync-conflict. `o2b brain entity set | get | list | relate |
-  archive` drives the registry from the CLI (upsert resolves names AND
+archive` drives the registry from the CLI (upsert resolves names AND
   aliases before creating anything and refuses duplicate claims; archive
   removes from active lookup, `--restore` returns); the read-only
   `brain_entity` MCP tool (`view: get | list`) serves lookups to agents.
@@ -4465,7 +4567,7 @@ path.
   `OPEN_SECOND_BRAIN_SEARCH_RELATION_POLARITY` (default on; vaults without
   typed relations rank identically either way).
 - **Retrieval feedback loop with learned recall weights.** `o2b search
-  feedback --query <q> --result <path> --verdict up|down` and the new MCP
+feedback --query <q> --result <path> --verdict up|down` and the new MCP
   tool `brain_recall_feedback` record one JSON event per feedback under
   `Brain/search/feedback/` (the conflict-free one-file-per-signal pattern).
   A deterministic, order-insensitive fold derives per-layer multipliers
@@ -6996,16 +7098,16 @@ eagerly via `o2b brain migrate-frontmatter --apply --yes`.
   vault markdown file. Two shapes are recognised: a single line
   (`@osb feedback negative topic=... principle="..."`) and a
   fenced ` `osb ```block with YAML body. Markers create a
-signal in`Brain/inbox/`via the same writer as`brain_feedback`,
-with `source_type: inline`, the source-file wikilink in `source`,
-and a `dedup_hash`over the normalised payload. After capture
-the source line is annotated`@osb✓ [[sig-...]]`(inline form)
-or the info-string flips to`osb-checked`with a`<!-- @osb✓
-                              [[sig-...]] -->`comment line (block form), making re-runs
-idempotent. Default ignore set covers`Brain/`, `.git`,
-`node_modules`, `.obsidian`, `.trash`, `.stversions`,
-`.open-second-brain`; additional excludes via `--exclude`,
-scope narrowing via `--path`, dry-run via `--dry-run`.
+  signal in`Brain/inbox/`via the same writer as`brain_feedback`,
+  with `source_type: inline`, the source-file wikilink in `source`,
+  and a `dedup_hash`over the normalised payload. After capture
+  the source line is annotated`@osb✓ [[sig-...]]`(inline form)
+  or the info-string flips to`osb-checked`with a`<!-- @osb✓
+                            [[sig-...]] -->`comment line (block form), making re-runs
+  idempotent. Default ignore set covers`Brain/`, `.git`,
+  `node_modules`, `.obsidian`, `.trash`, `.stversions`,
+  `.open-second-brain`; additional excludes via `--exclude`,
+  scope narrowing via `--path`, dry-run via `--dry-run`.
 - **`o2b brain import-session <path>`** — extract signals from a
   Claude Code / Codex CLI / Hermes session JSONL (or a directory
   of session files). Two extraction paths run in parallel:
@@ -8347,7 +8449,10 @@ plugin config (vault field)`, and exits with a clear
 - Sandbox vault and plugin manifest fixtures for tests.
 - GitHub release workflow for tag-based and manually dispatched releases.
 
-[1.77.1]: https://github.com/itechmeat/open-second-brain/compare/v1.77.0...v1.77.1
+[1.81.0]: https://github.com/itechmeat/open-second-brain/compare/v1.80.0...v1.81.0
+[1.80.0]: https://github.com/itechmeat/open-second-brain/compare/v1.79.0...v1.80.0
+[1.79.0]: https://github.com/itechmeat/open-second-brain/compare/v1.78.0...v1.79.0
+[1.78.0]: https://github.com/itechmeat/open-second-brain/compare/v1.77.0...v1.78.0
 [1.77.0]: https://github.com/itechmeat/open-second-brain/compare/v1.76.0...v1.77.0
 [1.76.0]: https://github.com/itechmeat/open-second-brain/compare/v1.75.0...v1.76.0
 [1.75.0]: https://github.com/itechmeat/open-second-brain/compare/v1.74.1...v1.75.0

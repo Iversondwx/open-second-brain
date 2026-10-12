@@ -16,8 +16,8 @@ o2b-mcp                       Console-script alias for `o2b mcp`, forwards all f
 o2b doctor                    Run vault + adapter checks
 o2b index                     Rebuild the Markdown page index
 o2b export-config             Write a redacted config snapshot
-o2b secrets list|status       Inspect $secret:NAME references without printing values
-o2b mcp                       Run the MCP tool server (stdio by default; --transport http binds loopback, and a key - --api-key or, kept out of the process list, OPEN_SECOND_BRAIN_MCP_API_KEY - is required only for a non-loopback --host); --scope full|writer|catalog, --tool-profile full|writer|catalog|recall|minimal (an unknown profile exits 2 rather than serving the full surface), --host-target <runtime>, --harness <id>, --probe, --allow-tool, --disable-tool, --max-tools
+o2b secrets list|status       Inspect $secret:NAME references without printing values; `--vault <path>` joins that vault's custody store (names and availability only, never a decrypt; without the flag both commands are byte-identical to the store-less report)
+o2b mcp                       Run the MCP tool server (stdio by default; --transport http binds loopback, and a credential - a key, --api-key or, kept out of the process list, OPEN_SECOND_BRAIN_MCP_API_KEY, or a non-empty per-agent token map from `o2b mcp token mint` - is required only for a non-loopback --host); a token-matched request authenticates as that token's agent for the request, the shared key keeps the process identity, and `mcp_tokens_required` / OPEN_SECOND_BRAIN_MCP_TOKENS_REQUIRED (default false) refuses credential-less requests while a non-empty token map exists; --scope full|writer|catalog, --tool-profile full|writer|catalog|recall|minimal (an unknown profile exits 2 rather than serving the full surface), --host-target <runtime>, --harness <id>, --probe, --allow-tool, --disable-tool, --max-tools
 o2b state status|migrate|rollback
                               Inventory the state this vault holds, move it to another directory, or put it back (see "State surfaces" below)
 o2b tool-call                 Invoke an MCP tool handler from the CLI
@@ -26,6 +26,8 @@ o2b help --json               Print the command/flag manifest as JSON
 o2b completions --shell zsh   Print completions for bash|zsh|fish|elvish|nushell|powershell
 o2b uninstall                 Print uninstall plan; --apply-local cleans config; --remove-cli removes symlinks
 o2b update                    Update Open Second Brain across all detected runtimes; --target <name> / --dry-run / --force / --json
+o2b bootstrap                 One-command harness provisioning for --target <name> (codex, grok, opencode run the adapter's idempotent apply; generic prints the payload plus manual steps; claude-code and zcode are plugin verify-only). --token mints mcp_token_<target> and prints the material exactly once - never on argv, never in a harness config; a second identical run is a byte-identical no-op; --rotate re-mints under the same name (effective on the next request, no restart); --check verifies drift; receipt at <vault>/.open-second-brain/bootstrap.lock.json
+o2b mcp token                 Per-agent MCP token management over the vault's hash-at-rest store: mint (derives mcp_token_<agent> unless --name), rotate, revoke, list; mint and rotate print the material exactly once with a shown-once notice, list shows metadata only
 ```
 
 ### `o2b version` (since v1.56.0)
@@ -429,6 +431,7 @@ o2b brain log verify          Walk every JSONL shard of the Brain log and report
 o2b brain set-primary         (CLI-only) Declare or clear primary_agent in Brain/_brain.yaml (--clear)
 o2b brain protect             (CLI-only) Emit / apply native deny rules for Brain/ (--target {claudecode|codex} [--apply])
 o2b brain unprotect           (CLI-only) Remove the Open-Second-Brain-managed deny rules for the chosen target
+o2b brain permissions         (CLI-only) Show the vault's trust policy document (Brain/_permissions.yaml) and a dry-run decision table resolving every declared agent against write/ingest/owner_write (`show`, --json adds the resolved rows), or list the decision ledger rows the gates append (`ledger --actor <name> --action <write|ingest|owner_write> --verdict <allow|ask|deny> --since <iso> --until <iso> --limit <n>`, --json). With no document every write is ungated; a document that cannot be read fails closed - `show` names the field and the file, and `o2b brain doctor` reports the same fault as `permissions-unreadable` with this verb as the exit
 o2b brain snapshot log        (CLI-only) Newest-first listing of every recovery point: run id, created_at, typed reason, size, manifest presence, derived-store coverage; --reason filters (unregistered value exits 2), --limit caps, --json
 o2b brain snapshot diff       (CLI-only) Read-only diff between two snapshots, or snapshot vs live Brain/
 o2b brain rollback            (CLI-only) Restore Brain/ from a snapshot (--dry-run previews; drift abort vs --force-rollback); --list, the prompt and --json name the snapshot reason ('unknown' when the sidecar records none)
@@ -437,7 +440,7 @@ o2b brain export              Read-only dump of active preferences, or (since v1
 o2b brain bank-export         (CLI-only) One-file backup bundle: preferences, the page graph, page contracts, the sources dashboard. Redacted on the way out; refuses with exit 1 on an unreadable `pref-*.md` (since v1.49.0)
 o2b brain bank-import         (CLI-only) Restore a bank bundle (--mode skip|overwrite|merge) [--trusted-restore]. Preference rows restore UNTRUSTED by default: every row lands `unconfirmed`, unpinned, at low confidence, on a fresh trial window dated from the restore - including a row the bundle already marked unconfirmed - and the run names each row it reset; `--trusted-restore` keeps the carried status, confidence, pin and window verbatim, for a backup you vouch for. A malformed preference already in the DESTINATION does not abort the import: the rows restore and the run prints `topic-key check incomplete: <path>` for each rule the topic-collision scan could not read, because that list is then a partial answer (since v1.49.0)
 o2b brain explorer            (CLI-only) Force-directed HTML graph of Brain/preferences + retired; live HTTP on 127.0.0.1 or --export <path> single-file. Keyboard-accessible listbox + localStorage layout persistence. Double-click a node to open it in Obsidian (live mode). Since v1.49.0 BOTH modes refuse a Brain file they cannot parse - `--export` writes nothing and exits 1, and live mode does not start, because a browser showing a silently smaller graph is the same lie as a written file - and `--export` runs the shared redactor over the graph, so its output differs from a pre-v1.49.0 export on any vault holding a credential-shaped value
-o2b brain doctor              Check Brain-specific invariants (status-vs-folder, broken wikilinks, ...). --remediate [--dry-run] plans a dependency-ordered repair and applies auto-safe content-hash re-stamps
+o2b brain doctor              Check Brain-specific invariants (status-vs-folder, broken wikilinks, ...). --remediate [--dry-run] plans a dependency-ordered repair and applies auto-safe content-hash re-stamps. Since v1.81.0 the report also prints a count-only archive section over Brain/.archives/ (entries, combined bytes, stamped pages whose entry is missing or mismatched, entries no page cites; silent on a vault that never archived a source) and runs the fail-soft `blank-session-identity` check, counting continuity records still carrying the legacy blank session id; both are informational and neither repairs
 o2b brain health              Semantic-health report (since v0.14.0): contradictory confirmed preferences, recurring concepts with no dedicated preference, stale claims, plus a clean | watch | investigate verdict
 o2b brain history             Render a preference's edit-history timeline (since v0.14.0): one entry per content mutation (principle / scope / status before -> after)
 o2b brain audit               Render a preference's full mutation audit trail (since v0.21.0): create / promote / update / retire / merge with agent, reason, revision + content-hash before/after. ret- or bare-slug arg resolves to the same trail
@@ -474,7 +477,7 @@ o2b brain idea-lineage        Trace how a derived artifact was reached: observat
 o2b brain note-lifecycle      <rename|move|archive|delete> <path> [<to>] [--apply] [--confirm] [--expect N] [--strict] [--json] - note-FILE lifecycle; source and destination both go through the create-note path envelope. Dry-run without --apply; delete also needs --confirm. A relocation rewrites inbound [[wikilinks]] vault-wide (both path spellings always, the bare basename only when exactly one note carries it) and the receipt names how stale the search index still is; delete rewrites nothing, reports the references it strands, and returns a recoverability verdict saying the archive it took does not cover a note outside Brain/
 o2b brain scaffold-stub       list [--limit N] [--json] | write <target> [--path <p>] [--source <s>...] [--if-exists refuse|skip] [--apply] [--json] - unresolved wikilink targets. list reads them from the search index and refuses with a state and a next_command when that index is missing or only partially resolved, never printing an empty list for an index nobody finished resolving; write materialises a stub whose title is the target and whose body links back to its sources. A target that already resolves, or names several notes, is refused
 o2b brain note-history        Decompose a note's git history into episodic phases split on a commit-time gap (since v1.11.0)
-o2b brain import-claude-memory (CLI-only) Import metadata.type=feedback entries from a Claude Code memory directory into Brain/preferences/. --dry-run / --apply, sidecar manifest for idempotency, UPDATE preserves accumulated evidence
+o2b brain import-claude-memory (CLI-only) Import metadata.type=feedback entries from a Claude Code memory directory into Brain/preferences/. --dry-run / --apply, sidecar manifest for idempotency, UPDATE preserves accumulated evidence; --approval-digest <hex> seals the plan - non-interactive --apply must carry the digest a prior --dry-run printed and then lands exactly the approved plan or nothing (a stale digest refuses with a re-run remedy), an entry whose name cannot land a parseable tag skips as a named row instead of aborting, and a digest paired with --dry-run refuses
 ```
 
 ### Time axis (since v0.10.18)
@@ -530,7 +533,7 @@ o2b brain session-grep        --query <text> [--session-id <id>] [--limit <n>] [
 o2b brain session-describe    --session-id <id> [--json]
 o2b brain session-expand      <record-id> [--raw-limit <n>] [--cursor <offset>] [--json]
 o2b brain handoff             <session-file> [--session-id <id>] [--format auto|claude|codex|hermes] [--json] - write Brain/handoffs/<date>-<scope>.md (since v0.37.0)
-o2b brain hygiene             scan | apply --ids <id,...> [--detectors conflicts,dedup,freshness,usefulness,slug-collisions,tags,capture-scope] [--dry-run] [--json] - hygiene findings pipeline; review findings never execute (since v1.3.0); the default sweep runs every detector except the opt-in ones (since v1.64.0: `slug-collisions` is default-on and reports same-stem groups such as topic.md beside topic-2.md as info findings, `tags` is opt-in and audits inline body tags only - frontmatter tags arrays are out of scope; since v1.67.0 `capture-scope` is default-on and warns, with proposed action review, when a retrievable page of active knowledge cites only sources that are currently url-only)
+o2b brain hygiene             scan | apply --ids <id,...> [--detectors conflicts,dedup,freshness,usefulness,slug-collisions,tags,capture-scope] [--dry-run] [--json] - hygiene findings pipeline; review findings never execute (since v1.3.0); the default sweep runs every detector except the opt-in ones (since v1.64.0: `slug-collisions` is default-on and reports same-stem groups such as topic.md beside topic-2.md as info findings, `tags` is opt-in and audits inline body tags only - frontmatter tags arrays are out of scope; since v1.67.0 `capture-scope` is default-on and warns, with proposed action review, when a retrievable page of active knowledge cites only sources that are currently url-only; since v1.81.0 the detector also names a cited source whose durable archive entry under Brain/.archives/ is missing or no longer matches the hash stamped on the page)
 o2b brain hygiene             scan: with the optional `dedup` decision-model use in enforce, dedup findings carry an advisory `decision_model` verdict and a confident `different` is listed last; `o2b brain doctor` annotates `entity-alias-candidate` warnings the same way; `apply` ignores verdicts
 o2b brain refresh             --stale [--dry-run] [--json] - targeted recompile of stale derived pages; orphans archive into Brain/.snapshots (since v1.3.0)
 o2b brain anticipate          --session <id> [--refresh] [--signal <text>] [--json] - read or warm the anticipatory context cache for the session's lineage root (since v1.3.0)
@@ -555,6 +558,7 @@ o2b brain trigger             scan | list [--status S] | ack <id> | dismiss <id>
 o2b brain deep-synthesis      <topic> [--limit N] [--triggers] [--json] - deterministic topic dossier: agreements, contradictions, stale claims, knowledge gaps, plus a strongest-objection steelman
 o2b brain ideas               [--cap N] [--triggers] [--json] - ranked next-direction candidates from open questions, orphan notes, aging signals
 o2b brain recall-telemetry    gate-list | gate-summary [--host <name>] [--since <iso>] [--until <iso>] [--limit <n>] [--json] - recall-gate decision telemetry (recall_gate_telemetry, default off)
+o2b brain recall-telemetry    dead-weight [--since <iso>] [--until <iso>] [--json] - pages currently in scope that no recorded recall ever surfaced (since v1.80.0): the complement of the telemetry window's retrieved set against the vault walk, with the window, the dead-page cap and the gate caveat in the report; record-only filters are refused by name rather than ignored (see "Memory observability")
 o2b search <query> --global   Cross-vault union over profiles + read-only sources; origin-labelled results; external vaults are never written to
 ```
 
@@ -625,13 +629,15 @@ o2b brain truth               ingest --entity E --aspect A --value V --source S 
                               conflicts [--window-days N] - value conflicts (independent sources within the window; resolution always ask_user)
                               aggregate --action W [--unit U] [--entity E] - sum exact (entity, action, unit) quantity matches
                               collisions [--window-days N] - cross-agent convergence on one entity
+                              events [--entity E] [--since X] [--until Y] [--limit N] - recall a windowed slice of the ledger (since v1.77.0); since v1.81.0 a row carrying a `sample_id` hydrates the provenance behind it - the named context receipt's items and the context-pack outcome row, resolved at the caller's reach, with "receipt known, outcome unknown" rendered rather than invented
+                              state --subject S --relation R --object O --text T --source S [--agent N] [--sample-id ID] - commit an agent-stated claim through the anchoring verdict (since v1.77.0); the optional opaque `--sample-id` (since v1.81.0) names the context-pack sample the claim drew on and is frozen on the committed event
                               sweep [--max-events N] - keep the newest N claim events and refold
 o2b brain facts               decompose (--file <path> | --text <text>) [--ingest --entity E] - deterministic atomic assertions; --ingest appends structured-family claims
 o2b brain dead-end            record --approach T --reason T [--context T] | list - negative-knowledge registry under Brain/dead-ends/
 o2b brain foresight           [--horizon-days N] [--write] - forward projection: routines coming due, open commitments, open questions
 ```
 
-Claims live as device-sharded append-only JSONL under `Brain/truth/` with a recomputable `state.json` fold - deleting the cache loses nothing. The merge guard rides `o2b brain merge` (an `entity-guard` refusal when the two preferences anchor disjoint people/orgs; `--force` bypasses). `o2b brain apply-evidence` accepts `--outcome success|failure|unknown`; the dream pass stages `outcome_regressions` with a deterministic confidence penalty when applied events carry repeated failures. `brain_review_candidates` annotates inbox signals with `signal_novelty` when the vault has indexed embeddings.
+Claims live as device-sharded append-only JSONL under `Brain/truth/` with a recomputable `state.json` fold - deleting the cache loses nothing. The merge guard rides `o2b brain merge` (an `entity-guard` refusal when the two preferences anchor disjoint people/orgs; `--force` bypasses). `o2b brain apply-evidence` accepts `--outcome success|failure|unknown`; the dream pass stages `outcome_regressions` with a deterministic confidence penalty when applied events carry repeated failures. `brain_review_candidates` annotates inbox signals with `signal_novelty` when the vault has indexed embeddings. Since v1.81.0 the provenance join behind a claim's `sample_id` is reach-shaped: one ledger read per report, rule-only receipt items and item paths the caller cannot read stay hidden below local reach, a claim timestamped before its claimed receipt is flagged as an inversion, and a row without a `sample_id` renders byte-identically to before.
 
 ### Write-time integrity and governance (since v0.44.0)
 
@@ -640,7 +646,7 @@ o2b brain label               <path> <dimension>=<value> | --remove <dimension> 
 o2b brain label               <path> --suggest [--dimensions a,b] - read-only advisory suggestions from the optional `labels` decision-model use; never assigns; `available: false` while the use is off; a private note is refused (see docs/decision-models/labels.md)
 o2b brain attr                <path> <field>=<value> | --remove <field> | --show - per-type attribute fields; an undeclared field error lists the declared fields WITH descriptions
 o2b brain tiers               check | restore <path> [--field F] --apply | accept <path> [--field F] - staged repair for identity-tier frontmatter hand-edits
-o2b brain secret              set <name> [--env-var V] [--allow PATTERN]... [--from-env SRC] | list | rm <name> | run <name> -- <command...> - capability-gated custody; the value enters via stdin, never argv
+o2b brain secret              set <name> [--env-var V] [--allow PATTERN]... [--from-env SRC] | list | rm <name> | run <name> -- <command...> | lock | unlock [--passphrase-from-env SRC] | export --out FILE [--passphrase-from-env SRC] | import FILE [--replace] [--passphrase-from-env SRC] [--vault <path>] - capability-gated custody; the value enters via stdin, never argv. `unlock` wraps the keyfile under a passphrase (read from stdin or --passphrase-from-env, never argv) and holds the key for this process only; `lock` clears that holder; `export` writes every entry as one passphrase-encrypted bundle to `--out` (values re-encrypted, names and env-var mappings travel in the clear past the shared egress redactor); `import` restores a bundle, refusing names the store already holds unless --replace
 o2b brain maintenance         run [--force] [--retry <task|custom:name>] [--force-cost] [--window H-H] [--tz ZONE] [--busy-minutes N] [--busy-threshold N] [--progress] | status [--limit N] - quiet-window lease-guarded lane for dream, reindex, bridges, clusters and declared custom tasks
 o2b brain maintenance         run --cron-template [--interval N] [--format cron|systemd] [--window H-H --tz ZONE] - print the cron or systemd recipe that schedules the lane (default interval 1h); prints and installs nothing
 ```
@@ -673,21 +679,22 @@ Wikilinks to frontmatter `aliases:` resolve at index materialization (schema v7)
 ### Write-path integrity and store safety (since v1.32.0)
 
 ```text
-o2b brain pending             list | apply <id> | reject <id> --reason <text> - review the opt-in write-approval queue (`write_approval.enabled`); staged extracted signals live in Brain/pending/, apply moves the unchanged document to the inbox, reject moves it to Brain/retired/ with the reason
+o2b brain pending             list [--lane signals|notes|ingest|all] | apply <id> [--dry-run] | reject <id> --reason <text> [--dry-run] - review the write-approval queues (`write_approval.enabled` plus the per-lane keys); signals stage flat in Brain/pending/ (sig- ids), note creates under Brain/pending/notes/ (note- ids carrying the encoded publish target), ingest summary pages under Brain/pending/ingest/ (ing- ids); list shows every lane sorted and names unreadable entries with a reason, apply moves the unchanged document to its decoded publish target (--dry-run previews and writes nothing), reject renders it into Brain/retired/ with the reason; everything staged under Brain/pending/ stays out of the search index (admission reason `review-pending`), so recall cannot surface an unreviewed document
 o2b brain signal retire       <id> --reason <text> [--superseded-by <id>] - move an inbox signal to Brain/retired/ with retire frontmatter (_status, retired_at, retired_reason, optional superseded_by, old-id alias); retired signals leave dream intake but stay queryable
 o2b brain entity prune        [--confirm] [--json] - list entity nodes whose labels fail the structural quality gate (dry-run default); --confirm removes nodes and their edges behind the snapshot gate and reports the recovery point
+o2b brain entity lexicon rebuild [--apply] [--json] - rebuild the store-learned label lexicon from the vault's own pages (dry-run default; --apply writes only the derived Brain/entities/lexicon.json)
 o2b brain forget-source       --confirm now snapshots Brain/ before any deletion and reports the snapshot run id; dry runs take no snapshot
 o2b brain doctor              gains the `symlink-escape` error (vault-internal symlink resolving outside the vault root) and the `entity-label-malformed` warning (prune candidates); `--remediate` gains the auto-safe `harden-permissions` step (owner-only chmod for existing Brain/ files, idempotent, step-capped, dry-run first)
 ```
 
-Extracted facts pass a deterministic durability gate before persisting: structural signals only (temp paths, progress counters, run-id and timestamp shapes, measurement-token dominance, exit-status shapes), extendable with `durability.denylist` regexes; rejections log `durability-skip` events and are surfaced by count in the route result. Entity labels are sanitized (`**Foo**` becomes `Foo`) and structurally validated at every intake boundary, with `entities.label_denylist` as the only vocabulary source. Feedback writes that closely resemble a confirmed same-scope preference return a conflict advisory (and log `write-conflict-advisory`) while the write proceeds. Embedding-side: `embedding_prefix_query`/`embedding_prefix_passage` (env twins, e5 preset defaults) control instruction prefixes, invalid vectors are rejected with `EMBEDDING_INVALID_VECTOR`, and quota exhaustion surfaces as non-retriable `EMBEDDING_QUOTA_EXHAUSTED` with Retry-After-aware backoff for plain rate limits.
+Extracted facts pass a deterministic durability gate before persisting: structural signals only (temp paths, progress counters, run-id and timestamp shapes, measurement-token dominance, exit-status shapes), extendable with `durability.denylist` regexes; rejections log `durability-skip` events and are surfaced by count in the route result. Entity labels are sanitized (`**Foo**` becomes `Foo`) and structurally validated at every intake boundary, with `entities.label_denylist` as the only vocabulary source. Since v1.80.0 the structural gate also learns from the store: entity creation consults the derived lexicon (`Brain/entities/lexicon.json`, dataset-hashed over the vault's own pages - no word list ships with the binary) and two more verdicts feed the existing heal triangle (`entity-label-malformed` findings plus `o2b brain entity prune`): a multi-token all-caps label with no prior stored occurrence (`shouted-heading`) and a caseful label whose every token is a learned common word (`function-word-run`) are refused at creation, while code-shaped labels (containing `_`, `.`, `/`, a digit, or internal uppercase) bypass both case rules, and labels in caseless scripts admit on the structural gate alone. The verdicts are advisory after admission: existing records are heal candidates, never auto-removed. Rebuild the lexicon with `o2b brain entity lexicon rebuild` after corpus edits; a stale, torn or expired artifact reads as absent, so admission degrades to today's structural behavior and never mis-rejects. Feedback writes that closely resemble a confirmed same-scope preference return a conflict advisory (and log `write-conflict-advisory`) while the write proceeds. Embedding-side: `embedding_prefix_query`/`embedding_prefix_passage` (env twins, e5 preset defaults) control instruction prefixes, invalid vectors are rejected with `EMBEDDING_INVALID_VECTOR`, and quota exhaustion surfaces as non-retriable `EMBEDDING_QUOTA_EXHAUSTED` with Retry-After-aware backoff for plain rate limits.
 
 ### Belief lifecycle and decision memory (since v1.33.0)
 
 ```text
 o2b brain lifecycle           tombstone <path> --reason <r> | supersede <path> --by <path> | temporal-replace <pred> <succ> --at <instant> | tip <path> | curator [--slice <s>] - cross-type soft-delete and supersession: tombstone is idempotent frontmatter (file stays for audit, leaves recall/inject/active.md), temporal-replace closes and opens at one shared instant with half-open [valid_from, valid_to) intervals, tip resolves the supersedes chain, curator lists injected-never-used / contradicted / high-used memories
 o2b brain claims              [--at <instant>] [--history] [--replaced <id>] [--contests <id>] [--rebuild] - claim-graph queries over existing relations and validity fields; current truth by default, history opt-in; --rebuild persists Brain/claim-graph.json deterministically
-o2b brain decision            record --title <t> --chosen <c> [--assumption <a>] [--review-date <d>] [--premortem <p>] [--commitment <tier>] | outcome <slug> <text> | rate <slug> <1-5> [--rationale <r>] | show | list [--rated] | compare <slug...> | similar --title <t> | history [--subject <id>] [--cursor <c>] | recall --prompt <p> [--turn <n>] [--count <n>] [--last-turn <n>] [--surfaced-ids <ids>] - decision records under Brain/decisions/; record opens one review obligation per review_date, history pages decision_change.v1 receipts, recall is governed by decision_recall.max_per_session and decision_recall.min_spacing_turns
+o2b brain decision            record --title <t> --chosen <c> [--assumption <a>] [--review-date <d>] [--premortem <p>] [--commitment <tier>] | outcome <slug> <text> | rate <slug> <1-5> [--rationale <r>] | show | list [--rated] | compare <slug...> | similar --title <t> | history [--subject <id>] [--cursor <c>] | recall --prompt <p> [--turn <n>] [--count <n>] [--last-turn <n>] [--surfaced-ids <ids>] - decision records under Brain/decisions/; record opens one review obligation per review_date, history pages decision_change.v1 receipts, recall is governed by decision_recall.max_per_session and decision_recall.min_spacing_turns; open decisions (write-side-trust): open --title <t> --question <q> --option <o> [--option <o>...] [--context <c>] parks a question at Brain/decisions/open-<slug>.md (duplicate question refuses naming the existing id), list_open [--status open|resolved|discarded] lists with unreadable records named, show_open <id> reads one, resolve <id> --choice <c> [--rationale <r>] mints the real decision page and stamps [[decision-<slug>]] plus one open-resolved receipt, discard <id> --reason <r> closes without deciding; terminal records stay in place
 o2b brain tension             detect [--jaccard <n>] | list [--unresolved] | show <id> | confirm <id> | dismiss <id> | resolve <id> - persisted contradictions under Brain/tensions/ with an open -> confirmed/dismissed/resolved state machine; re-detection refreshes the existing note; unresolved tensions warn at context-pack build time
 o2b brain tension             verify [<slug>] - read-only advisory decision-model verdict (contradicts | compatible | unrelated) per tension, or for every unresolved one; needs the optional `tension` use, else `available: false`; never changes a tension (see docs/decision-models/dedup-tension.md)
 o2b brain authored-at-backfill  [--apply] - stamp authored_at on pre-1.33.0 session signals from their preserved turn instant; dry-run default, idempotent, never re-embeds
@@ -699,7 +706,7 @@ Supersession is now consumer-aware: context packs inject only the tip of a super
 ### Source pipeline integrity and operator tooling (since v1.34.0)
 
 ```text
-o2b brain batch-plan          gains --src-subpath <rel> (scope a monorepo ingest to one subtree; escaping the source root is a typed error, and one crossing a submodule or nested checkout is refused outright; a subpath below a directory the repository itself ignores plans nothing and says so as an ignore warning), --exclude <pattern> (gitignore-style patterns through the shared ignore engine), and --reconcile (diff the plan's dispatched set against checkpoint completions and name every silently-lost source; a complete plan reports an explicit empty gap)
+o2b brain batch-plan          gains --src-subpath <rel> (scope a monorepo ingest to one subtree; escaping the source root is a typed error, and one crossing a submodule or nested checkout is refused outright; a subpath below a directory the repository itself ignores plans nothing and says so as an ignore warning), --exclude <pattern> (gitignore-style patterns through the shared ignore engine), and --reconcile (diff the plan's dispatched set against checkpoint completions and name every silently-lost source; a complete plan reports an explicit empty gap); a changed extraction contract is reported rather than absorbed - byte-identical sources reprocess once with the distinct contract-changed status (contract_changed and contract_changed_files keys under --json, an info line in text), a v1 manifest with no recorded contract included
 o2b brain pre-extract         <file> [--json] - deterministic no-LLM code-structure extraction (classes, functions, imports, inheritance edges, and in .tsx/.jsx files uses edges to the components opening tags name, as JSON entity/edge seeds) for TypeScript, JavaScript, and Python, and Terraform (.tf, .tfvars) block seeds in address syntax (resource, data, module, variable, output, provider, locals) with depends_on and references edges and a module source as an imports seed; .tfvars yields variable names, never values; credentials in any import specifier are redacted (the userinfo of an http(s), git+http(s) or git:: specifier, a user:password pair or a bare token, and the value of a named credential query parameter such as sshkey, token or an S3 or GCS signing key, also on a specifier that is not a URL such as git@host:org/repo?sshkey=...; a conventional login such as ssh://git@ is kept, and a credential in a path segment, a fragment or an unnamed query parameter is not recognised); a specifier longer than 2048 characters is carried as the redaction placeholder; on the ingest path a source larger than 1 MiB is skipped with a reason naming the limit; relative imports are bound to files (resolved_to) only on the ingest path, which has the content manifest; unknown extensions report extracted:false with a reason, never an empty success. Terraform limits, by name: .hcl and .tf.json files, attribute values, nested blocks (lifecycle, dynamic, provisioner, connection) as entities, depends_on expressions, citations inside heredocs or template files, for_each and count expansion, moved, import, check and removed blocks, terraform {} settings and required_providers, resolution of a local module source to a directory, and a block header split across lines are not read, the items of a multi-line depends_on list are read as ordinary citations and seeded as references, not depends_on, and quotes inside an interpolation (`"${f("x")}"`) are not tracked, which can end it early and drop citations later on that line
 o2b brain scan-citations      [--strict] - promote structural [Source: <name>, YYYY-MM-DD] markers in note prose into dated source-citation events on the temporal timeline; dedup on normalized name + date, malformed markers are reported and skipped (--strict exits nonzero on them)
 o2b brain doctor              gains --repair (preview targeted fixes for doctor-detected classes: dangling workrun checkpoints, dead evidence links; dry-run default) and --repair --apply (perform the fixes idempotently, one typed doctor-repair event each); unfixable classes are reported needs-review; plain doctor and --strict stay read-only
@@ -1293,6 +1300,36 @@ note: no conversation matched; <scanned> transcript file(s) scanned, <n> from an
 
 The four reasons sum to `scanned` minus the exported records, so an empty
 file under exit `0` can never be read as a machine that recorded nothing.
+
+### Session hallways (since v1.80.0)
+
+```text
+o2b brain hallways mine      [--min-co N] [--min-score X] [--limit N] [--min-sessions N] [--progress] - fold the mined-mention ledger into entity-to-session incidence and pairwise PMI; writes Brain/link-graph/hallways.json and the reviewable Brain/proposals/hallways.md
+o2b brain hallways show      read the proposals back
+o2b brain hallways promote   <family> <key> [--min-sessions N] - promote one association into the entity registry
+o2b brain hallways dismiss   <family> <key> - silence one key across future runs
+```
+
+While session import runs, a precision detector mines structured mentions
+from transcript turns - code symbols from spans, fences and
+qualified-identifier shapes, URLs, file paths in both slash directions,
+qualified identifiers - and refuses secret-shaped tokens (credential URLs,
+token or key query forms) outright, deduplicating at
+`(family, key, session)` granularity in a side ledger. The hallways pass
+folds that ledger into the associations of entities that keep turning up in
+the same imported transcripts even when no vault page links them, scored by
+pairwise PMI - the same math the vault-derived co-occurrence pass uses over
+a different corpus. The two graphs stay separate artifacts: hallways writes
+`Brain/link-graph/hallways.json` (dataset-hashed, fail-soft on a torn or
+stale read) beside, never merged into, the co-occurrence graph.
+
+Mining itself never writes an entity. `promote` is the only bridge into the
+registry, offered solely for keys seen in at least N distinct sessions
+(`--min-sessions`, default 3), and a promoted label still answers to the
+entity admission gate - one that fails the structural or lexicon verdicts is
+refused by the registry with its reason, not waved through. `dismiss`
+records the key in the artifact's dismissal set, and future mine runs skip
+it.
 
 ### Source distillation
 
@@ -1982,6 +2019,12 @@ o2b search rerank-eval        Rerank eval gate over a labelled dataset: runs the
                               --dataset PATH (required) --k N --compare-local --json. The
                               decision-model arm runs in enforce and needs an active decision-model
                               config; every query then sends its top candidates to that endpoint.
+                              Dataset queries may carry an optional `lang` field (since v1.80.0,
+                              non-empty string when present, default `en`, validated like
+                              `answer`); the report adds a per-language split beside the overall
+                              aggregates, each language folded with the same reduce over its
+                              per-query rows, so a bilingual dataset shows per-script lifts the
+                              blended number would average away.
 ```
 
 `search_rerank_kind` is `openai-compat` (default), `local` or
@@ -2422,6 +2465,57 @@ next read sees the current vault. Only agent activity triggers it.
 cron recipes of `o2b search reindex --cron-template` and the maintenance
 lane are still printed, but keyword freshness no longer needs them; a
 scheduled run remains the way to compute embeddings periodically.
+
+### Kind and property pushdown (since v1.80.0)
+
+```text
+o2b search query --kind page|section   narrow results to the page head (frontmatter plus the content before the first heading) or the heading sections under it
+```
+
+The v14 store migration adds a virtual `chunks.chunk_kind` column (`page`
+for chunk index 0, else `section`) with taxonomy indexes, a bounded
+`document_attributes` side table backfilled from each document's first
+chunk, and sargable path-prefix predicates (`path >= prefix AND path <
+prefix || U+FFFF`, with the caller prefix canonicalized, so a Windows
+backslash prefix now matches the same rows the POSIX spelling does). A
+`kind` filter pushes into the SQL of both lanes: the keyword lane filters
+before `ORDER BY`/`LIMIT`, the semantic lane filters inside its overfetch
+window. It is exposed as the MCP `brain_search`/`brain_query` `kind`
+argument and the CLI `--kind`.
+
+Promoted frontmatter keys push where the push is faithful to the live
+filter's verdict. `type` pushes the scalar declared values as the one
+normalized token the `page_type` column stores, `pinned` pushes only for
+the value `true` (the column folds absent and not-pinned together, so any
+other spelling judges the live frontmatter), and `visibility` pushes its
+normalized tokens against the `visibility` column. `tags` stays a post-rank
+live-file filter - the index's tag corpus is the inline tag links, which
+cannot answer for the frontmatter array the live filter judges - and the
+same holds for every non-scalar shape, such as a `type` the parser kept as
+an array. The attributes side table deliberately does not carry the
+promoted keys, so no key gains a second source of truth.
+
+Other property keys narrow candidates instead of replacing the filter. A
+filter on an unpromoted key runs a narrowing predicate against the bounded
+`document_attributes` snapshot: a document whose stored rows prove the
+mismatch drops out of the candidate pool in SQL, so a filtered query
+hydrates and reranks fewer candidates, while a document the table cannot
+speak for - no stored rows for that key, which is the standing answer past
+the 64-key and 16-value bounds - stays in the pool and the post-rank
+live-file filter judges it as before. The narrowing never decides the
+answer: results stay identical to the post-rank-only filter, over a
+smaller pool.
+
+**The divergence this buys, stated plainly:** a pushed filter answers AS
+INDEXED, not as the file on disk this instant. That is the same
+relationship to the live vault every other indexed facet has - the content
+itself is the indexed snapshot - but it is new for filters, so it is
+documented rather than implied: a page whose frontmatter changed after the
+last index run is judged by its indexed frontmatter until the next run
+indexes it, while an unpromoted key judges the live file, and the narrowing
+snapshot is arbitrated by that same live filter. A mixed filter map
+straddles the tiers by design. Absent filters compile byte-identical SQL to
+before this wave.
 
 ### The reserved visibility token (since v1.54.0)
 

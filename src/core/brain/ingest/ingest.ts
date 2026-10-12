@@ -44,14 +44,37 @@ import {
 import { isoSecond } from "../time.ts";
 import { sourcePagePath } from "../paths.ts";
 import { assertVaultIdentityForWrite } from "../vault-identity.ts";
-import { intakeExtraction, type ExtractionIntake } from "../intake/extract-intake.ts";
-import { normalizeSourceIdentity } from "../intake/source-trust.ts";
-import { INTAKE_TRUST, untrustedSourceFrontmatter } from "../trust/untrusted-provenance.ts";
+import {
+  intakeExtraction,
+  type ExtractionIntake,
+  type IntakeRelation,
+} from "../intake/extract-intake.ts";
+import {
+  SourceTrustError,
+  errnoCode,
+  isSourceHidden,
+  normalizeSourceIdentity,
+  readSourceOrigin,
+} from "../intake/source-trust.ts";
+import {
+  INTAKE_TRUST,
+  untrustedSourceFrontmatter,
+  type IntakeTrust,
+} from "../trust/untrusted-provenance.ts";
 import {
   captureScopeForTrust,
   captureScopeFrontmatter,
   type CaptureScope,
 } from "../provenance/capture-scope.ts";
+import {
+  SOURCE_ARCHIVE_BYTES_KEY,
+  SOURCE_ARCHIVE_HASH_KEY,
+  SourceArchiveError,
+  putSourceArchive,
+} from "../provenance/source-archive.ts";
+import type { FrontmatterCache } from "../../search/result-filters.ts";
+import { isPathReadableAtReach } from "../../search/result-filters.ts";
+import { TRANSPORT_REACH } from "../../graph/transport-reach.ts";
 import {
   renderProvenanceSection,
   sourceIdentityHash,
@@ -65,6 +88,13 @@ import {
   preExtractCodeStructure,
   type PreExtractResult,
 } from "./pre-extract.ts";
+import { REVIEW_LANE } from "../write-gate.ts";
+import {
+  listPendingLane,
+  resolveWriteDisposition,
+  stageForReview,
+} from "../pending/pending-lanes.ts";
+import type { WriteSubject } from "../write-disposition.ts";
 
 /** Frontmatter `kind:` marker of an ingested source summary page. */
 export const BRAIN_SOURCE_KIND = "brain-source";
@@ -112,6 +142,15 @@ export interface IngestSourceOptions {
    * nothing.
    */
   readonly readable?: (rel: string) => boolean;
+  /**
+   * The credential-minted subject of the caller (write-side-trust, Task
+   * 7), when the transport resolved one. It WINS over `agent` as the
+   * permission subject the review disposition consults - a caller-supplied
+   * agent is content attribution, never the identity a document's rules
+   * answer. Absent (stdio, the CLI) the disposition falls back to
+   * `agent`, then to the config identity.
+   */
+  readonly subject?: WriteSubject;
 }
 
 export interface IngestSourceResult {
@@ -134,6 +173,31 @@ export interface IngestSourceResult {
    */
   readonly captureScope: CaptureScope;
   /**
+   * Digest of the durable archive entry holding this source's bytes
+   * (redacted, content-addressed under `Brain/.archives/`), present only
+   * when the trusted-local branch captured them - the same value the
+   * summary page stamps as `source_archive_hash`. Absent means exactly
+   * "not archived": an unstamped page is a state, never a failure.
+   */
+  readonly sourceArchiveHash?: string;
+  /** UTF-8 byte count of the archived (redacted) entry, with the hash. */
+  readonly sourceArchiveBytes?: number;
+  /**
+   * The named reason an ELIGIBLE capture FAILED - a past-ceiling input the
+   * archive refused, or an archive write that could not land. Recorded so
+   * the skip is not silent; the page stays unstamped either way. A source
+   * that vanished between classification and the capture read is the
+   * deliberate silent arm: neither stamp nor refusal (absence stays
+   * absence), because a source that is gone is no longer trusted-local,
+   * not a failed capture. Nor is this field ever present when the source
+   * was simply not capture-eligible (untrusted, non-local, withheld from
+   * remote readers): those behave exactly as before this field existed.
+   * The text is identifiers only - a vault-relative source identity, byte
+   * counts, an errno code - never a host path, since the field crosses to
+   * the wire (see {@link archiveRefusalMessage}).
+   */
+  readonly sourceArchiveRefusal?: string;
+  /**
    * Code-structure pre-extraction seeds (P4), present only when the pass was
    * requested via {@link IngestSourceOptions.preExtract}. `extracted: false`
    * when the source is not a supported code file or has no readable bytes -
@@ -152,6 +216,28 @@ export interface IngestSourceResult {
    * format.
    */
   readonly table?: TableOutcome;
+  /**
+   * True when the review gate staged this FIRST publish of the summary
+   * page into `Brain/pending/ingest/` instead of `Brain/sources/`
+   * (write-side trust, Task 9). Registration - the intake, the manifest,
+   * the plan checkpoint - completes exactly as before; only the page's
+   * directory changes, and {@link pendingId} names the queue entry an
+   * operator applies to publish it. A re-ingest of an already-published
+   * page never stages: the review boundary is entry, not mutation.
+   */
+  readonly staged?: boolean;
+  /** Id of the pending queue entry holding the staged summary page. */
+  readonly pendingId?: string;
+  /**
+   * Present only on a staged ingest, and only when non-empty (review M13):
+   * extracted relations the intake deferred because applying one would have
+   * written `[[staged-id]]` into an already-published entity page - a link
+   * to an entity that exists only in the review queue, left behind for good
+   * if the operator rejects the staged page. They ride this result verbatim;
+   * the re-ingest a held-back manifest row guarantees applies them through
+   * the ordinary idempotent path once both endpoints are published.
+   */
+  readonly deferredRelations?: ReadonlyArray<IntakeRelation>;
 }
 
 /**
@@ -191,6 +277,32 @@ export function ingestSource(
   // producing two summary pages for one source against this pipeline's
   // documented idempotency.
   const canonicalSource = normalizeSourceIdentity(input.sourcePath);
+  // The page filename keys on the source-identity hash, not just the slug:
+  // two distinct non-ASCII / symbol-only source paths can slugify to the same
+  // fallback, which would silently clobber one summary with another. A hash
+  // suffix keeps distinct sources distinct while staying idempotent (the same
+  // source path always yields the same hash, hence the same file). Computed
+  // BEFORE the intake so the review disposition (write-side trust, Task 12)
+  // can name the exact target a deny refuses before anything is written.
+  const sourceHash = sourceIdentityHash([canonicalSource]);
+  const absPath = sourcePagePath(vault, `${slugify(canonicalSource)}-${sourceHash.slice(0, 12)}`);
+  // A summary page the caller may not read (it inherited a reserved
+  // source's visibility) is neither read nor rewritten, and the answer is
+  // the one an absent page gets: its path is deterministic, so `created`
+  // would otherwise tell the caller the page exists.
+  const summaryPath = canonicalNotePath(relative(vault, absPath));
+  // Review disposition (write-side trust, Tasks 9 and 12), resolved BEFORE
+  // the intake so a refusal lands before ANY write - no entity page, no
+  // manifest row, no summary page. With no permissions document the ingest
+  // lane's toggle decides (off = publish); with one, the document alone
+  // decides and a deny throws WriteRefusedError here, one ledger row behind
+  // it. The stage verdict is consumed at the page write below.
+  const disposition = resolveWriteDisposition(
+    vault,
+    REVIEW_LANE.ingest,
+    opts.subject ?? (opts.agent !== undefined ? { agent: opts.agent, via: "config" } : undefined),
+    { target: summaryPath, ...(opts.now !== undefined ? { now: opts.now } : {}) },
+  );
   const preExtract =
     opts.preExtract === true ? runPreExtract(vault, canonicalSource, opts.readable) : undefined;
   const sourceLink = `[[${canonicalSource}]]`;
@@ -200,11 +312,19 @@ export function ingestSource(
   // It used to be classified here as well and handed down as an argument,
   // which meant the same source was read twice and the second answer could be
   // overridden by the caller - see `intake/extract-intake.ts`.
+  // The disposition verdict rides along (the intake's disposition contract):
+  // on a `stage` verdict the intake stages the entity pages it CREATES into
+  // review beside the summary page, so a staged ingest publishes nothing -
+  // not the summary, not an entity page, not the manifest row below. The
+  // verdict was resolved ONCE above and is only forwarded here, never
+  // re-consulted. `refuse` is not expressible at this boundary: a deny threw
+  // at the resolution itself, before any write.
   const intake = intakeExtraction(vault, input.extraction, {
     agent: opts.agent,
     now: opts.now,
     provenance,
     ...(opts.readable !== undefined ? { readable: opts.readable } : {}),
+    ...(disposition.verdict === "stage" ? { disposition: "stage" as const } : {}),
   });
   const trust = intake.trust;
   const captureScope = captureScopeForTrust(trust);
@@ -213,19 +333,12 @@ export function ingestSource(
   // After the intake, which decided the lane: the derived section reads the
   // source only in the trusted lane and only at the caller's reach.
   const derivation = deriveSourceSection(vault, canonicalSource, trust, opts.readable);
+  // The durable archive: the trusted-local branch reads its source ONCE,
+  // redacts, and persists the bytes BEFORE the page write, so the stamp in
+  // the frontmatter below can only land on a page whose evidence is already
+  // on disk.
+  const archive = captureTrustedSourceArchive(vault, canonicalSource, trust);
 
-  // The page filename keys on the source-identity hash, not just the slug:
-  // two distinct non-ASCII / symbol-only source paths can slugify to the same
-  // fallback, which would silently clobber one summary with another. A hash
-  // suffix keeps distinct sources distinct while staying idempotent (the same
-  // source path always yields the same hash, hence the same file).
-  const sourceHash = sourceIdentityHash([canonicalSource]);
-  const absPath = sourcePagePath(vault, `${slugify(canonicalSource)}-${sourceHash.slice(0, 12)}`);
-  // A summary page the caller may not read (it inherited a reserved
-  // source's visibility) is neither read nor rewritten, and the answer is
-  // the one an absent page gets: its path is deterministic, so `created`
-  // would otherwise tell the caller the page exists.
-  const summaryPath = canonicalNotePath(relative(vault, absPath));
   const withheld = existsSync(absPath) && opts.readable?.(summaryPath) === false;
   const existed = !withheld && existsSync(absPath);
   const stamp = isoSecond(opts.now);
@@ -252,6 +365,16 @@ export function ingestSource(
     // the digest of the bytes the section was derived from, and its own
     // keys. Every other source adds nothing.
     ...derivation?.frontmatter,
+    // Durable evidence: the digest of the archived (redacted) source bytes
+    // and their count, ON SUCCESS ONLY. A page whose source was not archived
+    // adds nothing, so an unstamped page still reads as exactly "not
+    // captured" - absence is a state, never a failure.
+    ...(archive.hash !== undefined
+      ? {
+          [SOURCE_ARCHIVE_HASH_KEY]: archive.hash,
+          [SOURCE_ARCHIVE_BYTES_KEY]: archive.bytes,
+        }
+      : {}),
     created_at: kept.createdAt,
     updated_at: stamp,
     tags: ["brain", "brain/source"],
@@ -274,7 +397,31 @@ export function ingestSource(
   // unchanged source truly inert.
   const nextContents = formatFrontmatter(meta, body);
   const unchanged = existed && readFileSync(absPath, "utf8") === nextContents;
-  if (!withheld && !unchanged) {
+  // Review gate (write-side trust, Task 9): a FIRST publish of the summary
+  // page stages under the ingest lane while registration completes. The
+  // disposition itself was resolved BEFORE the intake (Task 12), so a deny
+  // refused the whole ingest before any write. A page that already exists
+  // was admitted when it was first ingested, so a re-ingest rewrites it
+  // directly - the review boundary is entry, not mutation. A withheld page
+  // is left exactly as an absent one, staged or not: the caller must not
+  // learn a page it cannot read exists.
+  let stagedFields: { readonly pendingId: string } | undefined;
+  if (!withheld && !unchanged && !existed && disposition.verdict === "stage") {
+    // One open entry per publish target (review M13): a re-ingest of a
+    // source whose summary is still staged re-renders the same page and
+    // used to refuse with a staged-target conflict. The open entry IS the
+    // staged summary - it is reused, never duplicated.
+    const open = listPendingLane(vault, REVIEW_LANE.ingest).entries.find(
+      (entry) => entry.publishTarget === summaryPath,
+    );
+    stagedFields = {
+      pendingId:
+        open !== undefined
+          ? open.id
+          : stageForReview(vault, REVIEW_LANE.ingest, summaryPath, () => nextContents).pendingId,
+    };
+  }
+  if (stagedFields === undefined && !withheld && !unchanged) {
     mkdirSync(dirname(absPath), { recursive: true });
     writeFrontmatterAtomic(absPath, meta, body, { overwrite: true });
   }
@@ -292,8 +439,16 @@ export function ingestSource(
   // digest anywhere, the manifest included.
   // Nor when the page was withheld: the manifest would then record a
   // summary as current that this call did not write.
+  // Nor on a `stage` disposition: the manifest row is a registration row of
+  // the same logical write as the summary and entity pages, so it owes the
+  // verdict they got (the intake's disposition contract) - a staged ingest
+  // must not record itself as done while its output awaits review. The row
+  // stays unrecorded until a publish arm actually writes; a re-ingest then
+  // re-classifies the source as new and re-runs, which is the fail-safe
+  // direction.
   if (
     !withheld &&
+    disposition.verdict !== "stage" &&
     trust === INTAKE_TRUST.trusted &&
     resolvesInsideVault(vault, canonicalSource) &&
     existsSync(join(vault, canonicalSource))
@@ -323,6 +478,14 @@ export function ingestSource(
     entitiesUpdated: intake.entitiesUpdated,
     connections,
     captureScope,
+    ...(archive.hash !== undefined
+      ? { sourceArchiveHash: archive.hash, sourceArchiveBytes: archive.bytes }
+      : {}),
+    ...(archive.refusal !== undefined ? { sourceArchiveRefusal: archive.refusal } : {}),
+    ...(stagedFields !== undefined ? { staged: true, pendingId: stagedFields.pendingId } : {}),
+    ...(intake.deferredRelations !== undefined
+      ? { deferredRelations: intake.deferredRelations }
+      : {}),
     ...(preExtract !== undefined ? { preExtract } : {}),
     ...(derivation?.parts !== undefined ? { parts: derivation.parts } : {}),
     ...(derivation?.table !== undefined ? { table: derivation.table } : {}),
@@ -335,6 +498,76 @@ export function ingestSource(
  * not worth a parse whose cost grows with the file.
  */
 export const PRE_EXTRACT_MAX_SOURCE_BYTES = 1_048_576;
+
+/** What the trusted-local branch's archive attempt concluded. */
+interface ArchiveCapture {
+  /** Digest of the persisted (redacted) entry, on success only. */
+  readonly hash?: string;
+  /** Its UTF-8 byte count, beside the digest. */
+  readonly bytes?: number;
+  /** The named refusal, when an eligible source could not be archived. */
+  readonly refusal?: string;
+}
+
+/** May a remote reader read the vault file at this vault-relative path? */
+function remotelyReadable(vault: string): (rel: string) => boolean {
+  const cache: FrontmatterCache = new Map();
+  return (rel) => isPathReadableAtReach(vault, rel, TRANSPORT_REACH.remote, cache);
+}
+
+/**
+ * The refusal text the capture records. `SourceArchiveError` and
+ * `SourceTrustError` carry identifiers and integers only, by contract;
+ * anything else reaching this catch is a host fs error whose own message
+ * embeds the absolute path the call failed on, so only its errno code (or
+ * error class) is kept - the same identifiers-only composition
+ * `source-trust`'s refusals use. The refusal rides the ingest result, so
+ * it never names a host path.
+ */
+function archiveRefusalMessage(error: unknown): string {
+  if (error instanceof SourceArchiveError || error instanceof SourceTrustError) {
+    return error.message;
+  }
+  return `source archive failed (${errnoCode(error)})`;
+}
+
+/**
+ * Archive the trusted source's bytes for re-verification, or say why not.
+ *
+ * Eligibility is the digest's own visibility rule, inherited: a trusted
+ * local source whose bytes are withheld from remote readers is never
+ * archived, or the archive would make the bytes MORE reachable than the
+ * digest that names them (the rule `extract-intake` applies to the content
+ * hash). Untrusted and non-local sources are not capture-eligible and
+ * behave byte-identically to before this lane existed.
+ *
+ * The read is the byte-keeping one (`readSourceOrigin`), so the digest and
+ * the archived bytes come off ONE descriptor and cannot describe two
+ * versions of the source. A capture failure - a past-ceiling refusal, a
+ * permission denial, a race with a deleting writer - never fails an ingest
+ * that already committed its knowledge: the named refusal is recorded on
+ * the result and the page simply stays unstamped.
+ */
+function captureTrustedSourceArchive(
+  vault: string,
+  canonicalSource: string,
+  trust: IntakeTrust,
+): ArchiveCapture {
+  if (trust !== INTAKE_TRUST.trusted) return {};
+  if (!resolvesInsideVault(vault, canonicalSource)) return {};
+  if (isSourceHidden(vault, canonicalSource, remotelyReadable(vault))) return {};
+  try {
+    const origin = readSourceOrigin(vault, canonicalSource);
+    // The silent arm: a vanished source is no longer trusted-local, not a
+    // failed capture - so neither stamp nor refusal (absence stays
+    // absence; see `sourceArchiveRefusal`'s contract).
+    if (origin.bytes === undefined) return {};
+    const put = putSourceArchive(vault, origin.bytes);
+    return { hash: put.hash, bytes: put.bytes };
+  } catch (error) {
+    return { refusal: archiveRefusalMessage(error) };
+  }
+}
 
 /** Why a source read yields no text, apart from a thrown error. */
 const SOURCE_UNREAD = Object.freeze({

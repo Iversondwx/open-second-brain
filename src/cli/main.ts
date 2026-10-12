@@ -16,12 +16,14 @@ import {
   defaultConfigPath,
   discoverConfig,
   resolveMcpToolProfile,
+  resolveVault,
   setConfigValue,
   validateTimezoneName,
 } from "../core/config.ts";
 import { BrainConfigError } from "../core/brain/policy/errors.ts";
 import { EGRESS_OUTCOME, redactForEgress } from "../core/egress/guard.ts";
 import { listSecretReferences } from "../core/secret-ref.ts";
+import { listNamedSecretAvailability, namedSecretAvailable } from "../core/secret-resolver.ts";
 import { BRAIN_INDEX_REL } from "../core/brain/paths.ts";
 import { ensureVaultCurrent } from "../core/maintenance/ensure-current.ts";
 import { checkSelfHealUpgrade } from "../core/maintenance/self-heal-upgrade-state.ts";
@@ -52,6 +54,7 @@ import { installMcpFaultGuard } from "./mcp-fault-guard.ts";
 import { handleVaultSubcommand } from "./vault.ts";
 import {
   NoVaultConfiguredError,
+  normalizeFlagString,
   requireVault,
   resolveSemanticConfigState,
   sortedReplacer,
@@ -70,6 +73,7 @@ import { windowsPathHint } from "./windows-path-hint.ts";
 import { cmdUpdate } from "./update.ts";
 import { ROOT_VERSION_FLAG_TOKEN, cmdVersion } from "./version.ts";
 import { planUninstall, renderPlan } from "./uninstall.ts";
+import { cmdBootstrap, handleMcpTokenCommand } from "./bootstrap/index.ts";
 import { cmdInstall } from "./install/install.ts";
 import { cmdUninstallTarget } from "./install/uninstall-target.ts";
 import { cmdInitInteractive } from "./install/init-interactive.ts";
@@ -82,7 +86,8 @@ import { CLI_COMMAND_MANIFEST, ROOT_VERSION_FLAG, manifestForJson } from "./comm
 import { COMPLETION_SHELLS, isCompletionShell, renderCompletions } from "./completions.ts";
 import { MCPServer } from "../mcp/server.ts";
 import { CLI_TRANSPORT_REACH } from "./transport-reach.ts";
-import { startHttp, isLoopbackHost } from "../mcp/http.ts";
+import { isLoopbackHost, resolveMcpTokensRequired, startHttp } from "../mcp/http.ts";
+import { hasAnyAgentToken } from "../core/brain/secrets/token-store.ts";
 import { serveStdio } from "../mcp/stdio.ts";
 import { SERVER_VERSION } from "../mcp/protocol.ts";
 import { buildToolTable } from "../mcp/tools.ts";
@@ -610,7 +615,13 @@ async function cmdExportConfig(argv: string[]): Promise<number> {
 
 async function cmdSecrets(argv: string[]): Promise<number> {
   if (argv.length === 0 || argv[0] === "-h" || argv[0] === "--help") {
-    process.stdout.write("usage: o2b secrets list|status [args...]\n");
+    // The one clarification the two surfaces cannot state inline: without
+    // --vault the fallback reads the reference name itself, so a store
+    // name and its env-var spelling can disagree without either lying.
+    process.stdout.write(
+      "usage: o2b secrets list|status [args...]\n" +
+        "Without --vault, the env fallback reads the reference name verbatim, case-sensitively.\n",
+    );
     return argv.length === 0 ? 2 : 0;
   }
   const verb = argv[0]!;
@@ -630,6 +641,7 @@ function cmdSecretsList(argv: string[]): number {
   const { flags, positional } = parseFlags(argv, {
     config: { type: "string" },
     json: { type: "boolean" },
+    vault: { type: "string" },
   });
   if (positional.length > 0) {
     process.stderr.write(
@@ -638,7 +650,14 @@ function cmdSecretsList(argv: string[]): number {
     return 2;
   }
   const discovery = discoverConfig(flags["config"] as string | undefined);
-  const refs = listSecretReferences(discovery.data, process.env);
+  // With `--vault`, availability joins the vault's custody store (metadata
+  // only - a locked envelope still counts); without it, the env-only
+  // lookup exactly as before.
+  const vault = normalizeFlagString(flags["vault"]);
+  const refs =
+    vault !== null
+      ? listNamedSecretAvailability(vault, discovery.data)
+      : listSecretReferences(discovery.data, process.env);
   if (flags["json"]) {
     process.stdout.write(
       JSON.stringify(
@@ -649,6 +668,10 @@ function cmdSecretsList(argv: string[]): number {
             config_key: ref.configKey,
             name: ref.name,
             available: ref.available,
+            // Present only on a reference the grammar cannot spell - a
+            // value that refuses at use time no matter what the store or
+            // the environment holds (additive-only row shape).
+            ...(ref.invalid === true ? { invalid: true } : {}),
           })),
         },
         null,
@@ -658,9 +681,9 @@ function cmdSecretsList(argv: string[]): number {
     return 0;
   }
   for (const ref of refs) {
-    process.stdout.write(
-      `${ref.configKey}: ${ref.name} (${ref.available ? "available" : "missing"})\n`,
-    );
+    const state =
+      ref.invalid === true ? "invalid reference" : ref.available ? "available" : "missing";
+    process.stdout.write(`${ref.configKey}: ${ref.name} (${state})\n`);
   }
   return 0;
 }
@@ -669,6 +692,7 @@ function cmdSecretsStatus(argv: string[]): number {
   const { flags, positional } = parseFlags(argv, {
     config: { type: "string" },
     json: { type: "boolean" },
+    vault: { type: "string" },
   });
   if (positional.length !== 1) {
     process.stderr.write("error: secrets status requires exactly one secret name\n");
@@ -676,7 +700,12 @@ function cmdSecretsStatus(argv: string[]): number {
   }
   void flags["config"];
   const name = positional[0]!;
-  const available = Boolean(process.env[name]);
+  // With `--vault`, a store-held name counts as available from metadata
+  // alone (a locked envelope still counts, no decrypt); without it, the
+  // env-only lookup exactly as before. The exit-code contract is
+  // unchanged: available exits 0, missing exits 1.
+  const vault = normalizeFlagString(flags["vault"]);
+  const available = vault !== null ? namedSecretAvailable(vault, name) : Boolean(process.env[name]);
   if (flags["json"]) {
     process.stdout.write(JSON.stringify({ name, available }, null, 2) + "\n");
   } else {
@@ -740,6 +769,13 @@ function quoteRefusedValue(value: string): string {
 }
 
 async function cmdMcp(argv: string[]): Promise<number> {
+  // `o2b mcp token` is a management sub-dispatcher, not the server: it
+  // mints, rotates, revokes and lists the named per-agent tokens in the
+  // vault's store. Routed before any flag parsing - the server's schema
+  // would read `token` as a stray positional and start serving - and it
+  // is dispatched through the same switch-case-visible `mcp` command, so
+  // the manifest census stays untouched.
+  if (argv[0] === "token") return handleMcpTokenCommand(argv.slice(1));
   const { flags } = parseFlags(argv, {
     vault: { type: "string" },
     config: { type: "string" },
@@ -839,11 +875,23 @@ async function cmdMcp(argv: string[]): Promise<number> {
     process.env["OPEN_SECOND_BRAIN_MCP_API_KEY"] ??
     undefined;
   // Bearer is optional on a loopback bind (the loopback bind + Host/Origin
-  // rebinding guard are the baseline defence) but mandatory on a non-loopback
-  // host, which would otherwise expose the Brain unauthenticated on the network.
-  if (transport === "http" && !isLoopbackHost(host) && (apiKey === undefined || apiKey === "")) {
+  // rebinding guard are the baseline defence) but a credential source is
+  // mandatory on a non-loopback host, which would otherwise expose the Brain
+  // unauthenticated on the network: the shared key, or a non-empty per-agent
+  // token map (write-side-trust, Task 7). The vault resolves without
+  // throwing here so the pre-check keeps its answer (and its exit code) on
+  // a machine with no vault at all.
+  const mapVault = (flags["vault"] as string | undefined) ?? resolveVault(config) ?? "";
+  const mintedTokens = mapVault !== "" && hasAnyAgentToken(mapVault);
+  if (
+    transport === "http" &&
+    !isLoopbackHost(host) &&
+    (apiKey === undefined || apiKey === "") &&
+    !mintedTokens
+  ) {
     process.stderr.write(
-      "o2b mcp: --api-key (or OPEN_SECOND_BRAIN_MCP_API_KEY) is required when --transport http binds a non-loopback --host\n",
+      "o2b mcp: --api-key (or OPEN_SECOND_BRAIN_MCP_API_KEY) or at least one minted agent token " +
+        "is required when --transport http binds a non-loopback --host\n",
     );
     return 2;
   }
@@ -910,6 +958,17 @@ async function cmdMcp(argv: string[]): Promise<number> {
     }
 
     if (transport === "http") {
+      // Enforcement needs both halves: the operator key AND a map to
+      // enforce against. With the key on but nothing minted yet the server
+      // starts and only says so - an outage would be the wrong answer for
+      // an operator one mint away from the posture they asked for.
+      if (resolveMcpTokensRequired(config) && !hasAnyAgentToken(vault)) {
+        process.stderr.write(
+          "o2b mcp: mcp_tokens_required is on, but no agent token is minted for this vault yet; " +
+            "credential-less requests are not refused until one exists " +
+            "(mint one with `o2b mcp token mint --agent <name>`)\n",
+        );
+      }
       const handle = await startHttp(
         { vault, configPath: config, repoRoot },
         { host, port, apiKey, faultCounts: () => faults.counts() },
@@ -1217,7 +1276,10 @@ export async function main(argv: ReadonlyArray<string>): Promise<number> {
     (rest[0] === "-h" || rest[0] === "--help") &&
     command !== "aider" &&
     command !== "brain" &&
-    command !== "vault"
+    command !== "vault" &&
+    // `secrets` has its own two-line help (the env fallback's name read
+    // is spelled there), so the generic URL stub would only bury it.
+    command !== "secrets"
   ) {
     process.stdout.write(`${command}: see https://github.com/itechmeat/open-second-brain\n`);
     if (command === "uninstall") {
@@ -1261,6 +1323,8 @@ async function dispatchCommand(command: string, rest: string[]): Promise<number>
         return await cmdInstallCli(rest);
       case "install":
         return await cmdInstall(rest);
+      case "bootstrap":
+        return await cmdBootstrap(rest);
       case "update":
         return await cmdUpdate(rest);
       case "uninstall":

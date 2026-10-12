@@ -4,6 +4,7 @@ import {
   BrainUpgradeError,
   type UpgradePlan,
 } from "../../../core/brain/upgrade.ts";
+import { basename } from "node:path";
 import {
   brainVerbContext,
   describeErrorChain,
@@ -59,6 +60,11 @@ export async function cmdBrainUpgrade(argv: string[]): Promise<number> {
     yes: { type: "boolean" },
     check: { type: "boolean" },
     json: { type: "boolean" },
+    // The plan digest a --dry-run printed and an operator approved
+    // (t_18fda844) - the upgrade twin of import-claude-memory's
+    // --approval-digest. Verified against the freshly computed plan
+    // before anything is written.
+    "approval-digest": { type: "string" },
     // The detached worker `ensureVaultCurrent` starts, with the lock claim
     // it was handed. Not an operator flag: the worker's outcome is
     // recorded, never printed (its streams are ignored).
@@ -130,6 +136,30 @@ export async function cmdBrainUpgrade(argv: string[]): Promise<number> {
     }
   }
 
+  // t_18fda844: a script that applies must apply the plan it approved.
+  // The digest comes from a prior `--dry-run` (the JSON plan output
+  // carries it); an interactive operator keeps the human escape hatch,
+  // exactly as with `--yes`. Verified against the plan this run just
+  // computed BEFORE anything is written - a plan that moved since the
+  // approved dry run is re-reviewed, never written over.
+  const approvalDigest = flags["approval-digest"] as string | undefined;
+  if (flags["json"] || !process.stdin.isTTY) {
+    if (approvalDigest === undefined) {
+      return fail(
+        "brain upgrade --apply requires --approval-digest in non-interactive mode " +
+          "(--json or non-TTY stdin); take it from the --dry-run plan output",
+      );
+    }
+  }
+  if (approvalDigest !== undefined && approvalDigest !== plan.digest) {
+    return fail(
+      `upgrade refused: approval digest mismatch: the plan changed since the approved ` +
+        `dry run (approved ${approvalDigest}, current plan ${plan.digest}); nothing was ` +
+        "written and no snapshot was taken. Re-run `o2b brain upgrade --dry-run` to review " +
+        "the current plan, then apply with its digest.",
+    );
+  }
+
   let result;
   const now = new Date();
   try {
@@ -172,7 +202,11 @@ export async function cmdBrainUpgrade(argv: string[]): Promise<number> {
     });
   } else {
     ok(`run_id: ${result.run_id}`);
-    ok(`snapshot: ${result.snapshot_path}`);
+    // Vault-relative, not the resolved path: the snapshot location is
+    // machine-derived, and the file name is already pinned by the run id
+    // printed directly above. The JSON twin keeps `snapshot_path` for
+    // consumers that need the resolved location.
+    ok(`snapshot: Brain/.snapshots/${basename(result.snapshot_path)}`);
     for (const p of result.files_updated) ok(`  updated: ${p}`);
   }
   return 0;

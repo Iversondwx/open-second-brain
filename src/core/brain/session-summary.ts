@@ -36,6 +36,7 @@ import { createHash } from "node:crypto";
 import { compositeScopeKey } from "../scope-key.ts";
 import { appendContinuityRecord, listContinuityRecords } from "./continuity/store.ts";
 import type { ContinuityRecord, ContinuitySourceRef } from "./continuity/types.ts";
+import { sessionIdOf } from "./session-recall.ts";
 import { resolveSessionScope, SessionScopeError } from "./session-scope.ts";
 
 export class SessionSummaryError extends Error {
@@ -67,7 +68,14 @@ export interface SessionSummaryInput {
 
 export interface SessionSummaryDigest {
   readonly id: string;
-  readonly sessionId: string;
+  /**
+   * The session the digest is scoped to, presence-gated (t_22d58fa7):
+   * omitted when the record names no session - the key absent, a
+   * non-string value, or the empty string. Absence stays absence; the
+   * `String(... ?? "")` coercion this replaces manufactured a `""`
+   * identity no writer ever stamped.
+   */
+  readonly sessionId?: string;
   readonly request: string | null;
   readonly decisions: ReadonlyArray<string>;
   readonly learnings: ReadonlyArray<string>;
@@ -171,12 +179,146 @@ export function appendSessionSummary(
 
 /** Latest digest for a session, or null when none was ever written. */
 export function getSessionSummary(vault: string, sessionId: string): SessionSummaryDigest | null {
+  return getSessionSummaryReport(vault, sessionId)?.digest ?? null;
+}
+
+/**
+ * How many divergence records the report samples, at most. The count is
+ * always the honest total; the sample keeps the NEWEST entries so the list
+ * reads as "the digests behind the latest answer", never a payload echo.
+ */
+export const DIVERGENCE_RECORD_SAMPLE_LIMIT = 20;
+
+/** One divergent digest, named by identity and content hash, never its payload. */
+export interface SessionSummaryRecordRef {
+  readonly id: string;
+  readonly createdAt: string;
+  readonly contentHash: string;
+}
+
+export interface SessionSummaryReport {
+  /** The sorted-latest digest - the same answer {@link getSessionSummary} gives. */
+  readonly digest: SessionSummaryDigest;
+  /**
+   * How many DISTINCT digests exist for this session id, content-hash
+   * dedupe applied. The same digest appended twice - the shape two
+   * devices produce when both summarized a session before their vaults
+   * synced - counts once.
+   */
+  readonly digestCount: number;
+  /**
+   * How many digest records exist for this session id BEFORE the
+   * content-hash dedupe - the revision count. A session re-summarized as
+   * it evolves accumulates rows without disagreeing; this keeps that
+   * stream visible without calling it divergence.
+   */
+  readonly revisions: number;
+  /**
+   * Present, always `true`, only when DISTINCT content hashes coexist at
+   * one `created_at` instant - the one shape the store's read model
+   * cannot order (two devices distilled the session differently before
+   * syncing, or two contents landed in the same second), so
+   * latest-wins is not a safe answer. A later revision wins
+   * deterministically and is a revision (counted in {@link revisions}),
+   * not divergence.
+   */
+  readonly divergent?: true;
+  /**
+   * Bounded newest-first-sample of the session's distinct digests, oldest
+   * first, present only alongside `divergent`.
+   */
+  readonly records?: ReadonlyArray<SessionSummaryRecordRef>;
+}
+
+/**
+ * Divergence-aware single-session read (t_59d4c919). The continuity store
+ * is append-only, so one session id can hold several digest records; the
+ * plain read answers latest-wins without saying so. This read names the
+ * fact: the sorted-latest digest, `digest_count` over DISTINCT content
+ * (two devices writing the same digest before their vaults sync count
+ * once), `revisions` for the honest record count, and, only when distinct
+ * content hashes meet at one instant - the one shape the store cannot
+ * order - `divergent: true` plus a bounded id/created_at/content_hash
+ * sample. Divergence is REPORTED here - never merged, deleted, or
+ * reconciled.
+ */
+export function getSessionSummaryReport(
+  vault: string,
+  sessionId: string,
+): SessionSummaryReport | null {
   const id = sessionId.trim();
+  // A record naming no session is skipped, never matched: the reads used
+  // to coerce the missing key to "" and answer a `""`-scoped read with
+  // every unrelated no-session digest lumped into one phantom session.
   const records = sessionDigestRecords(vault).filter(
-    (record) => String(record.payload["session_id"] ?? "") === id,
+    (record) => sessionIdOf(record.payload) === id,
   );
   if (records.length === 0) return null;
-  return toDigest(records[records.length - 1]!);
+  const revisions = records.length;
+
+  // Dedupe by content hash on read, keeping the newest record per hash -
+  // the store order is the tie-break the latest-wins answer already
+  // trusts. What survives is one entry per distinct digest content, in
+  // store order. The project axis joins the key because the write-side
+  // contract files the same content under two projects as two digests.
+  const newestPerKey = new Map<string, ContinuityRecord>();
+  for (const record of records) newestPerKey.set(readDedupeKey(record), record);
+  const distinct = records.filter((record) => newestPerKey.get(readDedupeKey(record)) === record);
+
+  // Divergence = distinct content hashes meeting at one created_at
+  // instant. Anything ordered by distinct instants is a revision stream
+  // (latest wins deterministically); only the same-instant meeting is a
+  // genuine "which one is the answer" conflict.
+  const hashesByInstant = new Map<string, Set<string>>();
+  for (const record of distinct) {
+    const instant = instantKey(record.createdAt);
+    const hashes = hashesByInstant.get(instant) ?? new Set<string>();
+    hashes.add(contentHashOf(record));
+    hashesByInstant.set(instant, hashes);
+  }
+  const divergent = [...hashesByInstant.values()].some((hashes) => hashes.size > 1);
+
+  return Object.freeze({
+    digest: toDigest(records[records.length - 1]!),
+    digestCount: distinct.length,
+    revisions,
+    ...(divergent
+      ? {
+          divergent: true as const,
+          records: Object.freeze(
+            distinct.slice(-DIVERGENCE_RECORD_SAMPLE_LIMIT).map((record) =>
+              Object.freeze({
+                id: record.id,
+                createdAt: record.createdAt,
+                contentHash: String(record.payload["content_hash"] ?? ""),
+              }),
+            ),
+          ),
+        }
+      : {}),
+  });
+}
+
+/** The read-side dedupe key: content hash within the digest's project scope. */
+function readDedupeKey(record: ContinuityRecord): string {
+  return `${readProject(record.payload) ?? ""}\u0000${contentHashOf(record)}`;
+}
+
+/** The record's content hash as stored; legacy or clipped records read as "". */
+function contentHashOf(record: ContinuityRecord): string {
+  return String(record.payload["content_hash"] ?? "");
+}
+
+/**
+ * The instant a record was created at, at millisecond precision, so the
+ * second- and millisecond-precision spellings both on disk compare equal.
+ * A shape Date cannot parse compares as its raw string - records are
+ * canonical-UTC-validated at the store boundary, so this is a floorslip,
+ * not a path.
+ */
+function instantKey(createdAt: string): string {
+  const ms = Date.parse(createdAt);
+  return Number.isFinite(ms) ? String(ms) : createdAt;
 }
 
 export interface ListSessionSummariesOptions {
@@ -204,22 +346,24 @@ export function listSessionSummaries(
   const project = normalizeProject(opts.project);
   return Object.freeze(
     sessionDigestRecords(vault)
-      .filter(
-        (record) => scope === undefined || String(record.payload["session_id"] ?? "") === scope,
-      )
+      // Same skip-not-match rule as the single-session read: a record
+      // naming no session is not in the asked-for session, and a coerced
+      // "" must never make it look like it is.
+      .filter((record) => scope === undefined || sessionIdOf(record.payload) === scope)
       .filter((record) => project === undefined || readProject(record.payload) === project)
       .map(toDigest),
   );
 }
 
 function sessionDigestRecords(vault: string): ReadonlyArray<ContinuityRecord> {
+  // `toSorted` is stable, so records the store reads in the same
+  // created_at instant keep the store's own arrival order - the tie-break
+  // that says which of two same-instant writes was written second. An id
+  // tie-break here would order same-instant digests by content hash,
+  // which is arbitrary, and "latest wins" would answer randomly.
   return listContinuityRecords(vault, { kind: KIND }).toSorted((left, right) =>
-    compareByCreatedThenId(left, right),
+    left.createdAt.localeCompare(right.createdAt),
   );
-}
-
-function compareByCreatedThenId(left: ContinuityRecord, right: ContinuityRecord): number {
-  return left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id);
 }
 
 function buildSourceRefs(
@@ -238,9 +382,10 @@ function toDigest(record: ContinuityRecord): SessionSummaryDigest {
   const payload = record.payload;
   const host = typeof payload["host"] === "string" ? (payload["host"] as string) : undefined;
   const project = readProject(payload);
+  const sessionId = sessionIdOf(payload);
   return Object.freeze({
     id: record.id,
-    sessionId: String(payload["session_id"] ?? ""),
+    ...(sessionId !== undefined ? { sessionId } : {}),
     request: typeof payload["request"] === "string" ? (payload["request"] as string) : null,
     decisions: readList(payload["decisions"]),
     learnings: readList(payload["learnings"]),
