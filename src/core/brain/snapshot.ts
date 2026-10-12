@@ -907,14 +907,16 @@ function logSnapshotEvent(
  * Decode one `readdirSync(..., { encoding: "buffer" })` entry to its UTF-8
  * name.
  *
- * Bun returns a `Uint8Array` here, not a `Buffer`, and `Uint8Array.toString()`
- * yields comma-joined byte values (`"46,100,..."`) instead of text. Every
- * exclusion comparison therefore missed, and `.snapshots` - this archive's
- * own directory - got packed into every archive, which is the exponential
- * growth. `Buffer.from` decodes either shape.
+ * The exclusion below is a string comparison, so it holds only while the
+ * entry decodes to its name. Bun and Node document `Buffer` entries, whose
+ * `toString()` is the name, but a runtime that hands back a bare
+ * `Uint8Array` renders comma-joined byte values (`"46,100,..."`) instead:
+ * nothing matches, and `.snapshots` - the archive home - is packed into
+ * every archive, so each one carries its predecessors. `Buffer.from`
+ * decodes either shape.
  */
 export function bufferEntryName(e: Uint8Array | Buffer): string {
-  return Buffer.isBuffer(e) ? e.toString("utf8") : Buffer.from(e).toString("utf8");
+  return Buffer.from(e).toString("utf8");
 }
 
 /** True for a top-level `Brain/` entry the snapshot family never touches. */

@@ -177,10 +177,7 @@ describe("the entries the snapshot family never touches", () => {
    * `.snapshots` and `.artifacts` are documented as never archived: the first
    * because archiving the archive home makes every snapshot carry its
    * predecessors and grow without bound, the second because it is ephemeral
-   * cache nobody wants restored. The exclusion is a string comparison against
-   * `readdirSync`'s buffer entries - which Bun returns as `Uint8Array`, whose
-   * `.toString()` is comma-joined byte values, not the name. Decoded that way
-   * nothing ever matched and the archive carried its own directory.
+   * cache nobody wants restored.
    */
   test("the archive carries neither .snapshots nor .artifacts", () => {
     const dirs = brainDirs(vault);
@@ -204,13 +201,10 @@ describe("the entries the snapshot family never touches", () => {
   });
 
   /**
-   * Bun's `readdirSync(..., { encoding: "buffer" })` hands back `Buffer`
-   * instances, so the archive test above only ever reaches the
-   * `Buffer.isBuffer(e)` arm. The `Uint8Array` arm - the one that actually
-   * exists to decode byte values instead of comma-joined numbers - would
-   * stay untested, and reverting the fix to `e.toString()` would leave that
-   * test green. These two feed a bare `Uint8Array` straight to the decoders
-   * so the arm is pinned rather than merely assumed.
+   * Bun and Node hand back `Buffer` entries, so the archive test above
+   * never sees a bare `Uint8Array`, and reverting the decoder to
+   * `e.toString()` would leave it green. These two feed a bare `Uint8Array`
+   * straight to the decoders so that shape is pinned rather than assumed.
    */
   test("a bare Uint8Array entry decodes to its name, not to byte values", () => {
     const excluded = new Uint8Array(new TextEncoder().encode(".snapshots"));
