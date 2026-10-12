@@ -11,7 +11,10 @@
  * - {@link LEDGER_KEY_ACTIVE}: vault paths the SessionStart digest emitted.
  * - {@link LEDGER_KEY_REGROUND}: digest parts 2..n plus a delivery cursor.
  * - {@link LEDGER_KEY_SUBAGENT_INJECT}: sub-agent ids the PostToolUse
- *   carrier already delivered the standing rules to.
+ *   carrier already delivered the standing rules to, plus the
+ *   vault-relative note paths the delivered payload was built from (the
+ *   evidence an answer-time quote check may verify that sub-agent's
+ *   quoted spans against).
  *
  * Every entry carries a {@link LEDGER_TTL_MS} expiry refreshed on each write.
  * Readers degrade to "empty" on any failure and never throw; writers return
@@ -47,6 +50,15 @@ export const RECALL_SET_MAX = 2000;
 export const SUBAGENT_SET_MAX = 200;
 
 /**
+ * Ceiling on the delivered-evidence path set recorded beside the ids: one
+ * delivery names a handful of note files, but a session that spawns many
+ * sub-agents across a large vault must not grow the scope file that every
+ * lock-free reader re-parses. Past the cap the oldest paths drop first,
+ * like the ids beside them.
+ */
+export const SUBAGENT_PATHS_MAX = 200;
+
+/**
  * True only for a string session id with at least one ASCII alphanumeric, the
  * same floor `resolveSessionScope` needs; anything less would collapse to the
  * shared default scope. A sessionless host gets no ledger at all, so one
@@ -60,6 +72,19 @@ export function isRealSessionId(sessionId: unknown): sessionId is string {
 function stringList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is string => typeof item === "string");
+}
+
+/** Read one ledger key's raw array field; empty when absent or expired. */
+function readRawList(
+  vault: string,
+  sessionId: string,
+  key: string,
+  field: string,
+  nowMs: number,
+): unknown[] {
+  const stamp = readHookStamp(vault, sessionId, key, nowMs);
+  const value = stamp?.data?.[field];
+  return Array.isArray(value) ? value : [];
 }
 
 /** Read one ledger key's string-array field as a set; empty when absent or expired. */
@@ -123,15 +148,67 @@ export function readSubagentDeliveredIds(
 }
 
 /**
- * Merge `agentId` into the session's delivered set and refresh its expiry.
- * An expired set is dropped rather than merged. Past {@link SUBAGENT_SET_MAX}
- * ids the oldest drop first (a re-delivered id keeps its first position, which
- * is enough for a dedupe hint). Returns `false` on any failure.
+ * Vault-relative note paths the delivered carrier payloads were built from
+ * this session (answer-trust wave): the evidence a sub-agent turn can be
+ * quoted against. A truncated delivery - the payload carried only a
+ * prefix of the note - records `{ path, truncated: true }`, because the
+ * evidence is the prefix, not the file; a plain string names a whole-note
+ * delivery. Rows recorded before the paths field existed - and deliveries
+ * whose payload carried no note content - read as an empty list, so an
+ * old ledger row is silence for the quote check, never an error.
+ */
+export type SubagentEvidencePath = string | { readonly path: string; readonly truncated: boolean };
+
+function evidencePathEntry(value: unknown): SubagentEvidencePath | null {
+  if (typeof value === "string" && value.length > 0) return value;
+  if (typeof value === "object" && value !== null && "path" in value) {
+    const record = value as { path: unknown; truncated?: unknown };
+    if (typeof record.path === "string" && record.path.length > 0) {
+      return { path: record.path, truncated: record.truncated === true };
+    }
+  }
+  return null;
+}
+
+export function readSubagentDeliveredPaths(
+  vault: string,
+  sessionId: string,
+  nowMs: number = Date.now(),
+): ReadonlyArray<SubagentEvidencePath> {
+  const raw = readRawList(vault, sessionId, LEDGER_KEY_SUBAGENT_INJECT, "paths", nowMs);
+  const byPath = new Map<string, SubagentEvidencePath>();
+  for (const item of raw) {
+    const entry = evidencePathEntry(item);
+    if (entry === null) continue;
+    const path = typeof entry === "string" ? entry : entry.path;
+    const prior = byPath.get(path);
+    // Truncation is sticky: once a delivery named a clipped prefix of a
+    // note, later whole-string rows cannot widen the evidence back.
+    if (prior === undefined) {
+      byPath.set(path, entry);
+    } else if (typeof entry === "object" && entry.truncated) {
+      byPath.set(path, entry);
+    }
+  }
+  return [...byPath.values()];
+}
+
+/**
+ * Merge `agentId` - and the `evidencePaths` the delivered payload was
+ * built from, when the carrier names any - into the session's delivered
+ * record and refresh its expiry. Paths are a second list beside the ids
+ * and merge the same way: a re-delivery without paths keeps what earlier
+ * deliveries merged, so evidence already handed to this session's
+ * sub-agents stays named. An expired record is dropped rather than
+ * merged. Past {@link SUBAGENT_SET_MAX} ids and {@link SUBAGENT_PATHS_MAX}
+ * paths the oldest drop first (a re-delivered id keeps its first position,
+ * which is enough for a dedupe hint). Returns `false` on any failure.
  */
 export function recordSubagentDeliveredId(
   vault: string,
   sessionId: string,
   agentId: string,
+  evidencePaths: ReadonlyArray<SubagentEvidencePath> = [],
   nowMs: number = Date.now(),
 ): boolean {
   const outcome = updateHookState(
@@ -139,11 +216,34 @@ export function recordSubagentDeliveredId(
     sessionId,
     (state, now) => {
       const prior = liveData(state[LEDGER_KEY_SUBAGENT_INJECT], now);
-      const merged = new Set([...stringList(prior?.["ids"]), agentId]);
-      const all = [...merged];
+      const mergedIds = new Set([...stringList(prior?.["ids"]), agentId]);
+      const allIds = [...mergedIds];
+      // Path-keyed merge; a truncated entry (the payload carried only a
+      // prefix) is sticky over a plain whole-note row of the same path.
+      const merged = new Map<string, SubagentEvidencePath>();
+      for (const item of [
+        ...(Array.isArray(prior?.["paths"]) ? prior["paths"] : []),
+        ...evidencePaths,
+      ]) {
+        const entry = evidencePathEntry(item);
+        if (entry === null) continue;
+        const path = typeof entry === "string" ? entry : entry.path;
+        const priorEntry = merged.get(path);
+        if (priorEntry === undefined) {
+          merged.set(path, entry);
+        } else if (typeof entry === "object" && entry.truncated) {
+          merged.set(path, entry);
+        }
+      }
+      const allPaths = [...merged.values()];
       state[LEDGER_KEY_SUBAGENT_INJECT] = {
         expiresAt: now + LEDGER_TTL_MS,
-        data: { ids: all.slice(Math.max(0, all.length - SUBAGENT_SET_MAX)) },
+        data: {
+          ids: allIds.slice(Math.max(0, allIds.length - SUBAGENT_SET_MAX)),
+          ...(allPaths.length > 0
+            ? { paths: allPaths.slice(Math.max(0, allPaths.length - SUBAGENT_PATHS_MAX)) }
+            : {}),
+        },
       };
       return { state, result: true };
     },

@@ -437,3 +437,122 @@ describe("claim validity windows (presence-gated, schema v1)", () => {
     expect(warnings.map((w) => w.message)).toEqual(["invalid claim extractor: 42"]);
   });
 });
+
+describe("claim sample_id (presence-gated, schema v1)", () => {
+  // The same windowless line the validity block pins: a sample-less
+  // append must serialize byte-identically to the pre-attribution
+  // ledger, so the schema version never moves for this field.
+  const PLAIN_LINE =
+    JSON.stringify({
+      v: 1,
+      ts: "2026-06-01T10:00:00Z",
+      agent: "claude-dev-agent",
+      entity: "alice mason",
+      aspect: "employer",
+      value: "Google",
+      valueKind: "text",
+      source: "[[Brain/notes/standup.md]]",
+    }) + "\n";
+
+  test("a sample-less append writes a byte-identical line (no sample_id key)", () => {
+    const written = append();
+    expect(readFileSync(written.path, "utf8")).toBe(PLAIN_LINE);
+    expect("sample_id" in written.event).toBe(false);
+  });
+
+  test("a present sample_id is stored verbatim and roundtrips through the reader", () => {
+    const written = append({ sample_id: "rcpt-2026-0601-abcd" });
+    const row = JSON.parse(readFileSync(written.path, "utf8")) as Record<string, unknown>;
+    // Opaque caller-supplied id: stored verbatim, never normalized.
+    expect(row["sample_id"]).toBe("rcpt-2026-0601-abcd");
+    expect(row["v"]).toBe(1);
+    expect(written.event.sample_id).toBe("rcpt-2026-0601-abcd");
+    const { events, warnings } = readClaimEvents(vault);
+    expect(warnings).toHaveLength(0);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.sample_id).toBe("rcpt-2026-0601-abcd");
+  });
+
+  test("an empty or whitespace-only sample_id refuses the append, writing nothing", () => {
+    // Named refusal, never coerced: a blank id means nothing and is not
+    // upgraded to an absent one behind the caller's back.
+    expect(() => append({ sample_id: "" })).toThrow(/sample_id/);
+    expect(() => append({ sample_id: "   " })).toThrow(/sample_id/);
+    expect(readClaimEvents(vault).events).toHaveLength(0);
+  });
+
+  test("a sample_id over the 256-character cap refuses the append by name", () => {
+    // L2.1 regression: the id is copied onto every claim stated against
+    // the sample, so an unbounded one multiplied one call's payload
+    // across the ledger. The refusal names the limit.
+    expect(() => append({ sample_id: "r".repeat(300) })).toThrow(
+      /sample_id must be a non-empty string of at most 256 characters/,
+    );
+    // Exactly at the cap is acceptable.
+    expect(append({ sample_id: "r".repeat(256) }).event.sample_id).toHaveLength(256);
+    expect(readClaimEvents(vault).events).toHaveLength(1);
+  });
+
+  test("a sample_id carrying a control character refuses the append by name", () => {
+    // Non-whitespace control characters (NUL, bell, DEL) refuse by name;
+    // whitespace controls are removed by the same trim both paths apply,
+    // so they never reach this check.
+    expect(() => append({ sample_id: "rcpt\u0000-1" })).toThrow(
+      /sample_id must be a non-empty string of at most 256 characters without control characters/,
+    );
+    expect(() => append({ sample_id: "rcpt\u0007-1" })).toThrow(/without control characters/);
+    expect(() => append({ sample_id: "rcpt-1\u007F" })).toThrow(/without control characters/);
+    expect(readClaimEvents(vault).events).toHaveLength(0);
+  });
+
+  test("a whitespace-padded sample_id is stored trimmed, matching what the stated path threads", () => {
+    // L2.2 regression: the store applies the SAME trim as the stated
+    // boundary, so a padded id threads and stores identically on both
+    // paths and the provenance join resolves what was threaded.
+    const written = append({ sample_id: "  rcpt-2026-0601-abcd  " });
+    expect(written.event.sample_id).toBe("rcpt-2026-0601-abcd");
+    const row = JSON.parse(readFileSync(written.path, "utf8")) as Record<string, unknown>;
+    expect(row["sample_id"]).toBe("rcpt-2026-0601-abcd");
+  });
+
+  test("the reader passes a stored sample_id through verbatim, whatever it spells", () => {
+    // The id is opaque: the reader validates it is a non-empty string and
+    // otherwise keeps the caller's exact bytes.
+    mkdirSync(truthDir(vault), { recursive: true });
+    const opaque = {
+      v: 1,
+      ts: "2026-06-01T09:00:00Z",
+      agent: "a",
+      entity: "alice mason",
+      aspect: "employer",
+      value: "Google",
+      valueKind: "text",
+      source: "[[x]]",
+      sample_id: "req-hash:0123456789abcdef",
+    };
+    writeFileSync(join(truthDir(vault), "claims.jsonl"), JSON.stringify(opaque) + "\n");
+    const { events, warnings } = readClaimEvents(vault);
+    expect(warnings).toHaveLength(0);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.sample_id).toBe("req-hash:0123456789abcdef");
+  });
+
+  test("a sample_id that is not a non-empty string drops the line with a warning", () => {
+    mkdirSync(truthDir(vault), { recursive: true });
+    const badId = {
+      v: 1,
+      ts: "2026-06-01T09:00:00Z",
+      agent: "a",
+      entity: "alice mason",
+      aspect: "employer",
+      value: "Google",
+      valueKind: "text",
+      source: "[[x]]",
+      sample_id: 42,
+    };
+    writeFileSync(join(truthDir(vault), "claims.jsonl"), JSON.stringify(badId) + "\n");
+    const { events, warnings } = readClaimEvents(vault);
+    expect(events).toHaveLength(0);
+    expect(warnings.map((w) => w.message)).toEqual(["invalid claim sample_id: 42"]);
+  });
+});

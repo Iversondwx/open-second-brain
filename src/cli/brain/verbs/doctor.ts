@@ -1,5 +1,21 @@
+import { join } from "node:path";
+
 import { resolveSearchConfig } from "../../../core/search/index.ts";
 import { runDoctor } from "../../../core/brain/doctor.ts";
+import {
+  reportSweptFailure,
+  SWEEP_ORIGIN,
+  type SweptPath,
+} from "../../../core/brain/doctor/unreadable-path.ts";
+import { BRAIN_ARCHIVES_REL } from "../../../core/brain/path-constants.ts";
+import {
+  auditArchiveStamps,
+  type ArchiveStampAudit,
+} from "../../../core/brain/hygiene/detectors/capture-scope.ts";
+import {
+  sourceArchiveStats,
+  type ArchiveStats,
+} from "../../../core/brain/provenance/source-archive.ts";
 import { annotateEntityAliasIssues } from "../../../core/brain/doctor/entity-alias-verdicts.ts";
 import { verdictFields, verdictLine } from "../../../core/decision-model/pair-verdict.ts";
 import { applyRepair, type RepairOutcome } from "../../../core/brain/diagnostics.ts";
@@ -70,6 +86,43 @@ function renderIssueLine(
 function explainMissingExits(codes: Iterable<string>, stream: AdvisoryStream): void {
   if (!advisoryIsLegal(stream)) return;
   for (const [code, reason] of noExitReasons(codes)) info(`no exit: ${code} - ${reason}`);
+}
+
+/**
+ * One archive section: the counts, or the named unavailability when the
+ * store itself could not be read.
+ */
+type ArchiveSection = (ArchiveStats & ArchiveStampAudit) | { readonly unavailable: true };
+
+/**
+ * The informational archive section (answer trust): counts only - how many
+ * entries the durable source archive holds, their combined size, how many
+ * stamped pages lost their entry or disagree with it, and how many entries
+ * no page cites anymore. No fix verb: an archive is evidence, so pruning
+ * and recapture are operator calls, and the named findings live on the
+ * hygiene scan. Count-only also keeps this section from becoming a second
+ * finding surface the scans would have to agree with.
+ *
+ * Fail-soft: the section runs AFTER the fail-soft check pass, and an
+ * unreadable `Brain/.archives` used to throw past it - in `--json` mode
+ * printing nothing at all. An informational section's failure is
+ * uncertainty, not a failed run: the read is wrapped, the skip is named in
+ * the pass's `uncertain` stream exactly as the doctor's own sweeps name
+ * one, and the JSON answers `archives: { unavailable: true }`.
+ */
+function archiveSection(vault: string, swept: SweptPath): ArchiveSection {
+  try {
+    return { ...sourceArchiveStats(vault), ...auditArchiveStamps(vault) };
+  } catch (err) {
+    reportSweptFailure(
+      join(vault, BRAIN_ARCHIVES_REL),
+      "directory listing failed",
+      err,
+      swept,
+      SWEEP_ORIGIN.root,
+    );
+    return { unavailable: true };
+  }
 }
 
 export async function cmdBrainDoctor(argv: string[]): Promise<number> {
@@ -163,7 +216,21 @@ export async function cmdBrainDoctor(argv: string[]): Promise<number> {
   // deliberately does not feed the exit code: uncertainty is not a
   // failure, and folding it into `--strict` would turn an unreadable
   // field into a broken build.
-  const uncertain = result.uncertain ?? [];
+  // A mutable copy of the pass's stream: the archive section below appends
+  // its own skip to it, and `runDoctor` returned the array frozen.
+  const uncertain = [...(result.uncertain ?? [])];
+  // The sweep identity the archive section reports its skips under - the
+  // consequence names the question an unreadable store leaves open.
+  const swept: SweptPath = {
+    site: "brain.doctor.archiveSection",
+    consequence: "the archive counts could not be taken",
+    uncertain,
+  };
+  // The archive section is taken ONCE, before anything is rendered or
+  // derived from the streams: an unreadable store names its skip in the
+  // stream above, so the failure feeds the exit census and is visible in
+  // the same pass instead of one key (or one line) late.
+  const section = archiveSection(vault, swept);
 
   // Every code the three streams reported, in the order an operator reads
   // them. Feeds both the rail and the explanation of what the rail could
@@ -201,6 +268,11 @@ export async function cmdBrainDoctor(argv: string[]): Promise<number> {
           // every issue record: a reason is about a CLASS, unlike a next
           // command, and two hundred malformed timestamps share one.
           ...(noExit.size > 0 ? { [NO_EXIT_KEY]: Object.fromEntries(noExit) } : {}),
+          // Count-only informational archive section (answer trust): the
+          // key is always present, so a caller never infers the section's
+          // existence from a missing key - and when the store could not be
+          // read, the key names the unavailability instead of a count.
+          archives: section,
         },
         null,
         2,
@@ -216,6 +288,25 @@ export async function cmdBrainDoctor(argv: string[]): Promise<number> {
     for (const u of uncertain) process.stdout.write(renderIssueLine("[UNSURE]", u));
     if (result.errors.length === 0 && result.warnings.length === 0 && uncertain.length === 0) {
       ok("brain doctor: clean");
+    }
+    // One line, and only when there is something to describe: a vault that
+    // has never archived a source gains no line at all, and an orphaned
+    // entry - evidence no page cites - is something to describe. An
+    // unreadable store is already named by its `[UNSURE]` line above, so
+    // it gains no counts line either.
+    const archives = "unavailable" in section ? null : section;
+    if (
+      archives !== null &&
+      (archives.entries > 0 ||
+        archives.missing > 0 ||
+        archives.mismatched > 0 ||
+        archives.uncited > 0)
+    ) {
+      process.stdout.write(
+        `archives: ${archives.entries} entries, ${archives.totalBytes} bytes, ` +
+          `${archives.missing} missing, ${archives.mismatched} mismatched, ` +
+          `${archives.uncited} uncited\n`,
+      );
     }
   }
 

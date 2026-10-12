@@ -1,5 +1,6 @@
 /**
- * Capture-scope detector: active knowledge that rests on url-only sources.
+ * Capture-scope detector: active knowledge that rests on url-only sources,
+ * and pages whose claimed durable archive is gone or no longer matches.
  *
  * A page whose every cited source has no local bytes behind it rests on a
  * locator that may rot, and nothing on the page says so once the untrusted
@@ -7,6 +8,20 @@
  * (a research report). This detector names those pages: one `warning` per
  * page, `review` proposed action - deciding whether to capture the source,
  * re-cite a local one or retire the page is an operator call.
+ *
+ * The archive arm (answer trust) is the second condition, and the sharper
+ * one: an ingest summary stamped `source_archive_hash` claims durable
+ * evidence behind it, and a stamp whose entry is absent - or present but
+ * re-hashing differently - is exactly the rot this detector exists to name,
+ * with the difference that the page SAID the evidence was there. It fires
+ * however fresh the live source file is: the claim under test is the
+ * archive's, not the file's.
+ *
+ * One finding per page: when both arms fire for the same page (a vanished
+ * file whose archive entry went too), the archive finding wins - it
+ * subsumes the url-only condition under the stronger statement that claimed
+ * evidence is gone - and the per-page finding id stays unique, which the
+ * apply plan's selection requires.
  *
  * Inspected: retrievable pages (the retrieval trust gate does not
  * quarantine them) of the four knowledge kinds - distillations, ingest
@@ -25,6 +40,13 @@
  * and never hides the other pages' findings. A cited file the caller may not
  * read at its reach counts as url-only, the answer an absent file gives, so
  * a finding never tells a narrower caller that a hidden page exists.
+ *
+ * The archive arm answers from the store, not from any caller's reach: the
+ * verification is a fact about `Brain/.archives/` and the page's own stamp,
+ * and the caller who may not read the page never sees the finding (the
+ * scan's artifact-reference view withholds it with the page). A stamp that
+ * is not a hash names no entry the store could hold, so it verifies as
+ * `missing` - the stamp cannot be true.
  *
  * Cited sources are read with the shared source-link readers: the page's
  * `source_path` plus the targets under its `## Sources` heading.
@@ -57,6 +79,12 @@ import {
   resolveCaptureScope,
   type CaptureScope,
 } from "../../provenance/capture-scope.ts";
+import {
+  ARCHIVE_VERIFICATION,
+  SOURCE_ARCHIVE_HASH_KEY,
+  sourceArchiveUncitedHashes,
+  verifySourceArchive,
+} from "../../provenance/source-archive.ts";
 import { SourceTrustError, isSourceHidden } from "../../intake/source-trust.ts";
 import { sourcesSectionTargets } from "../../source-links.ts";
 import { hygieneFindingId } from "./id.ts";
@@ -64,8 +92,12 @@ import type { HygieneFinding } from "../types.ts";
 
 export const CAPTURE_SCOPE_DETECTOR_ID = "capture-scope" as const;
 
-/** One-line summary every finding of this detector carries. */
+/** One-line summary every url-only finding of this detector carries. */
 export const CAPTURE_SCOPE_FINDING_TITLE = "Active knowledge rests on url-only sources";
+
+/** One-line summary every archive-stamp finding of this detector carries. */
+export const CAPTURE_SCOPE_ARCHIVE_FINDING_TITLE =
+  "A page's durable source archive is missing or no longer matches its stamp";
 
 /** Frontmatter key holding a single-source page's source identity. */
 const SOURCE_PATH_KEY = "source_path";
@@ -154,6 +186,11 @@ function inspectPage(vault: string, page: string, readable: Readable): HygieneFi
   if (!isRetrievableKnowledge(meta)) return null;
 
   const sources = citedSources(meta, body);
+  // The archive arm first, so a page failing BOTH conditions reports the
+  // sharper archive finding once - never two findings with one id.
+  const archiveFinding = inspectArchiveStamp(vault, page, meta, sources);
+  if (archiveFinding !== null) return archiveFinding;
+
   if (sources.length === 0) return null;
   const allUrlOnly = sources.every((source) => isUrlOnly(vault, source, readable));
   if (!allUrlOnly) return null;
@@ -170,6 +207,41 @@ function inspectPage(vault: string, page: string, readable: Readable): HygieneFi
     targets,
     proposed_action: "review" as const,
     evidence: Object.freeze({ sources: Object.freeze([...sources]), stamped }),
+  });
+}
+
+/**
+ * The archive arm: does the page's claimed durable evidence still hold?
+ * `null` for a page with no stamp (absence means "not captured", never a
+ * finding) and for a stamp whose entry verifies; otherwise one finding per
+ * page carrying the named verification state.
+ */
+function inspectArchiveStamp(
+  vault: string,
+  page: string,
+  meta: FrontmatterMap,
+  sources: ReadonlyArray<string>,
+): HygieneFinding | null {
+  const hash = stringValue(meta, SOURCE_ARCHIVE_HASH_KEY);
+  if (hash === null) return null;
+  // A malformed stamp verifies as `missing` - it names no entry the store
+  // could hold, which is the state it is in.
+  const state = verifySourceArchive(vault, hash).state;
+  if (state === ARCHIVE_VERIFICATION.verified) return null;
+
+  const targets = Object.freeze([page]);
+  return Object.freeze({
+    id: hygieneFindingId(CAPTURE_SCOPE_DETECTOR_ID, targets),
+    detector: CAPTURE_SCOPE_DETECTOR_ID,
+    severity: "warning" as const,
+    title: CAPTURE_SCOPE_ARCHIVE_FINDING_TITLE,
+    targets,
+    proposed_action: "review" as const,
+    evidence: Object.freeze({
+      archive: state,
+      hash,
+      sources: Object.freeze([...sources]),
+    }),
   });
 }
 
@@ -193,4 +265,51 @@ export function detectCaptureScope(
     if (finding !== null) findings.push(finding);
   }
   return Object.freeze(findings);
+}
+
+/** What {@link auditArchiveStamps} counted. */
+export interface ArchiveStampAudit {
+  /** Stamped pages whose archive entry is absent. */
+  readonly missing: number;
+  /** Stamped pages whose entry is there but re-hashes differently. */
+  readonly mismatched: number;
+  /**
+   * Store entries NO page cites - the structurally unreachable leftovers
+   * the two counts above cannot see: a re-stamped page orphans the entry
+   * the old stamp named, and a staged ingest rejected by review leaves
+   * its entry behind. Evidence, not scratch, so the audit names them
+   * rather than pruning them; release is an operator call made through
+   * delete-by-source cleanup.
+   */
+  readonly uncited: number;
+}
+
+/**
+ * Count the archive's rot, on both of its populations: the stamped pages
+ * whose entry is gone or disagrees, and the store entries no page cites.
+ * One walk over `Brain/sources/` for the stamps, one over the stamp roots
+ * and the store for the uncited entries. Every stamp counted: unlike the
+ * scan's finding list, no page is skipped for quarantine or reach,
+ * because the doctor runs locally and reports a count, not a disclosure.
+ * Integers, never a page list - recapture and pruning are operator calls
+ * made from the hygiene scan's findings, not from these numbers.
+ */
+export function auditArchiveStamps(vault: string): ArchiveStampAudit {
+  const counts = {
+    missing: 0,
+    mismatched: 0,
+    uncited: sourceArchiveUncitedHashes(vault).length,
+  };
+  const abs = join(vault, BRAIN_SOURCES_REL);
+  if (!existsSync(abs)) return counts;
+  for (const rel of listVaultNotePaths(abs)) {
+    const page = posix.join(BRAIN_SOURCES_REL, rel.split("\\").join("/"));
+    const [meta] = parseFrontmatter(join(vault, page));
+    const hash = stringValue(meta, SOURCE_ARCHIVE_HASH_KEY);
+    if (hash === null) continue;
+    const state = verifySourceArchive(vault, hash).state;
+    if (state === ARCHIVE_VERIFICATION.missing) counts.missing += 1;
+    else if (state === ARCHIVE_VERIFICATION.mismatched) counts.mismatched += 1;
+  }
+  return counts;
 }

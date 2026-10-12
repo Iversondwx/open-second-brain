@@ -49,13 +49,32 @@ import {
   type ExtractionIntake,
   type IntakeRelation,
 } from "../intake/extract-intake.ts";
-import { normalizeSourceIdentity } from "../intake/source-trust.ts";
-import { INTAKE_TRUST, untrustedSourceFrontmatter } from "../trust/untrusted-provenance.ts";
+import {
+  SourceTrustError,
+  errnoCode,
+  isSourceHidden,
+  normalizeSourceIdentity,
+  readSourceOrigin,
+} from "../intake/source-trust.ts";
+import {
+  INTAKE_TRUST,
+  untrustedSourceFrontmatter,
+  type IntakeTrust,
+} from "../trust/untrusted-provenance.ts";
 import {
   captureScopeForTrust,
   captureScopeFrontmatter,
   type CaptureScope,
 } from "../provenance/capture-scope.ts";
+import {
+  SOURCE_ARCHIVE_BYTES_KEY,
+  SOURCE_ARCHIVE_HASH_KEY,
+  SourceArchiveError,
+  putSourceArchive,
+} from "../provenance/source-archive.ts";
+import type { FrontmatterCache } from "../../search/result-filters.ts";
+import { isPathReadableAtReach } from "../../search/result-filters.ts";
+import { TRANSPORT_REACH } from "../../graph/transport-reach.ts";
 import {
   renderProvenanceSection,
   sourceIdentityHash,
@@ -153,6 +172,31 @@ export interface IngestSourceResult {
    * paraphrase, not a capture.
    */
   readonly captureScope: CaptureScope;
+  /**
+   * Digest of the durable archive entry holding this source's bytes
+   * (redacted, content-addressed under `Brain/.archives/`), present only
+   * when the trusted-local branch captured them - the same value the
+   * summary page stamps as `source_archive_hash`. Absent means exactly
+   * "not archived": an unstamped page is a state, never a failure.
+   */
+  readonly sourceArchiveHash?: string;
+  /** UTF-8 byte count of the archived (redacted) entry, with the hash. */
+  readonly sourceArchiveBytes?: number;
+  /**
+   * The named reason an ELIGIBLE capture FAILED - a past-ceiling input the
+   * archive refused, or an archive write that could not land. Recorded so
+   * the skip is not silent; the page stays unstamped either way. A source
+   * that vanished between classification and the capture read is the
+   * deliberate silent arm: neither stamp nor refusal (absence stays
+   * absence), because a source that is gone is no longer trusted-local,
+   * not a failed capture. Nor is this field ever present when the source
+   * was simply not capture-eligible (untrusted, non-local, withheld from
+   * remote readers): those behave exactly as before this field existed.
+   * The text is identifiers only - a vault-relative source identity, byte
+   * counts, an errno code - never a host path, since the field crosses to
+   * the wire (see {@link archiveRefusalMessage}).
+   */
+  readonly sourceArchiveRefusal?: string;
   /**
    * Code-structure pre-extraction seeds (P4), present only when the pass was
    * requested via {@link IngestSourceOptions.preExtract}. `extracted: false`
@@ -289,6 +333,11 @@ export function ingestSource(
   // After the intake, which decided the lane: the derived section reads the
   // source only in the trusted lane and only at the caller's reach.
   const derivation = deriveSourceSection(vault, canonicalSource, trust, opts.readable);
+  // The durable archive: the trusted-local branch reads its source ONCE,
+  // redacts, and persists the bytes BEFORE the page write, so the stamp in
+  // the frontmatter below can only land on a page whose evidence is already
+  // on disk.
+  const archive = captureTrustedSourceArchive(vault, canonicalSource, trust);
 
   const withheld = existsSync(absPath) && opts.readable?.(summaryPath) === false;
   const existed = !withheld && existsSync(absPath);
@@ -316,6 +365,16 @@ export function ingestSource(
     // the digest of the bytes the section was derived from, and its own
     // keys. Every other source adds nothing.
     ...derivation?.frontmatter,
+    // Durable evidence: the digest of the archived (redacted) source bytes
+    // and their count, ON SUCCESS ONLY. A page whose source was not archived
+    // adds nothing, so an unstamped page still reads as exactly "not
+    // captured" - absence is a state, never a failure.
+    ...(archive.hash !== undefined
+      ? {
+          [SOURCE_ARCHIVE_HASH_KEY]: archive.hash,
+          [SOURCE_ARCHIVE_BYTES_KEY]: archive.bytes,
+        }
+      : {}),
     created_at: kept.createdAt,
     updated_at: stamp,
     tags: ["brain", "brain/source"],
@@ -419,6 +478,10 @@ export function ingestSource(
     entitiesUpdated: intake.entitiesUpdated,
     connections,
     captureScope,
+    ...(archive.hash !== undefined
+      ? { sourceArchiveHash: archive.hash, sourceArchiveBytes: archive.bytes }
+      : {}),
+    ...(archive.refusal !== undefined ? { sourceArchiveRefusal: archive.refusal } : {}),
     ...(stagedFields !== undefined ? { staged: true, pendingId: stagedFields.pendingId } : {}),
     ...(intake.deferredRelations !== undefined
       ? { deferredRelations: intake.deferredRelations }
@@ -435,6 +498,76 @@ export function ingestSource(
  * not worth a parse whose cost grows with the file.
  */
 export const PRE_EXTRACT_MAX_SOURCE_BYTES = 1_048_576;
+
+/** What the trusted-local branch's archive attempt concluded. */
+interface ArchiveCapture {
+  /** Digest of the persisted (redacted) entry, on success only. */
+  readonly hash?: string;
+  /** Its UTF-8 byte count, beside the digest. */
+  readonly bytes?: number;
+  /** The named refusal, when an eligible source could not be archived. */
+  readonly refusal?: string;
+}
+
+/** May a remote reader read the vault file at this vault-relative path? */
+function remotelyReadable(vault: string): (rel: string) => boolean {
+  const cache: FrontmatterCache = new Map();
+  return (rel) => isPathReadableAtReach(vault, rel, TRANSPORT_REACH.remote, cache);
+}
+
+/**
+ * The refusal text the capture records. `SourceArchiveError` and
+ * `SourceTrustError` carry identifiers and integers only, by contract;
+ * anything else reaching this catch is a host fs error whose own message
+ * embeds the absolute path the call failed on, so only its errno code (or
+ * error class) is kept - the same identifiers-only composition
+ * `source-trust`'s refusals use. The refusal rides the ingest result, so
+ * it never names a host path.
+ */
+function archiveRefusalMessage(error: unknown): string {
+  if (error instanceof SourceArchiveError || error instanceof SourceTrustError) {
+    return error.message;
+  }
+  return `source archive failed (${errnoCode(error)})`;
+}
+
+/**
+ * Archive the trusted source's bytes for re-verification, or say why not.
+ *
+ * Eligibility is the digest's own visibility rule, inherited: a trusted
+ * local source whose bytes are withheld from remote readers is never
+ * archived, or the archive would make the bytes MORE reachable than the
+ * digest that names them (the rule `extract-intake` applies to the content
+ * hash). Untrusted and non-local sources are not capture-eligible and
+ * behave byte-identically to before this lane existed.
+ *
+ * The read is the byte-keeping one (`readSourceOrigin`), so the digest and
+ * the archived bytes come off ONE descriptor and cannot describe two
+ * versions of the source. A capture failure - a past-ceiling refusal, a
+ * permission denial, a race with a deleting writer - never fails an ingest
+ * that already committed its knowledge: the named refusal is recorded on
+ * the result and the page simply stays unstamped.
+ */
+function captureTrustedSourceArchive(
+  vault: string,
+  canonicalSource: string,
+  trust: IntakeTrust,
+): ArchiveCapture {
+  if (trust !== INTAKE_TRUST.trusted) return {};
+  if (!resolvesInsideVault(vault, canonicalSource)) return {};
+  if (isSourceHidden(vault, canonicalSource, remotelyReadable(vault))) return {};
+  try {
+    const origin = readSourceOrigin(vault, canonicalSource);
+    // The silent arm: a vanished source is no longer trusted-local, not a
+    // failed capture - so neither stamp nor refusal (absence stays
+    // absence; see `sourceArchiveRefusal`'s contract).
+    if (origin.bytes === undefined) return {};
+    const put = putSourceArchive(vault, origin.bytes);
+    return { hash: put.hash, bytes: put.bytes };
+  } catch (error) {
+    return { refusal: archiveRefusalMessage(error) };
+  }
+}
 
 /** Why a source read yields no text, apart from a thrown error. */
 const SOURCE_UNREAD = Object.freeze({

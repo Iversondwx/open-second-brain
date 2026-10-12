@@ -14,12 +14,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { bootstrapBrain } from "../../src/core/brain/init.ts";
 import { brainDirs } from "../../src/core/brain/paths.ts";
+import { ingestSource as ingestCore } from "../../src/core/brain/ingest/ingest.ts";
 import { atomicWriteFileSync } from "../../src/core/fs-atomic.ts";
 import { resetVaultIdentityPins } from "../../src/core/brain/vault-identity.ts";
 import { HYGIENE_TOOLS } from "../../src/mcp/brain/hygiene-tools.ts";
@@ -272,5 +273,179 @@ describe("the capture-scope detector on the hygiene surfaces", () => {
     expect(props["detectors"]!.description.length).toBeLessThanOrEqual(PROPERTY_DESCRIPTION_MAX);
     expect(tool.description).toContain("url-only");
     expect(tool.description.length).toBeLessThanOrEqual(TOOL_DESCRIPTION_MAX);
+  });
+});
+
+/**
+ * The archive finding (answer trust, Task C5) rides the same CLI scan: a
+ * summary page stamped with an archive digest whose entry is gone is a
+ * named finding in the default sweep, and the scan stays read-only about
+ * it. An intact entry and an unstamped page are not findings.
+ */
+describe("the capture-scope archive finding on the CLI scan", () => {
+  const DETECTOR = "capture-scope";
+  const SOURCE = "Articles/keep.md";
+  const ingestSource = (contents: string): { summaryPath: string; hash: string } => {
+    mkdirSync(join(vault, "Articles"), { recursive: true });
+    writeFileSync(join(vault, SOURCE), contents, "utf8");
+    const res = ingestCore(
+      vault,
+      {
+        sourcePath: SOURCE,
+        summary: "Kept durable.",
+        extraction: { entities: [{ category: "concept", name: "Keep" }], relations: [] },
+      },
+      { agent: "test-agent", now: new Date("2026-02-02T00:00:00Z") },
+    );
+    if (res.sourceArchiveHash === undefined) throw new Error("expected an archive stamp");
+    return { summaryPath: res.summaryPath, hash: res.sourceArchiveHash };
+  };
+
+  test("a missing entry is a finding in the default sweep; an intact one is not", async () => {
+    const { hash } = ingestSource("kept bytes\n");
+    expect((await scan()).findings).toEqual([]);
+
+    rmSync(join(vault, "Brain", ".archives", `${hash}.txt`));
+    const report = await scan();
+    const finding = report.findings.find((f) => f.detector === DETECTOR);
+    expect(finding).toBeDefined();
+    expect(finding!.proposed_action).toBe("review");
+    expect(report.counts[DETECTOR]).toBeGreaterThanOrEqual(1);
+  });
+
+  test("the finding names the summary page and the scan stays read-only", async () => {
+    const { summaryPath, hash } = ingestSource("other bytes\n");
+    rmSync(join(vault, "Brain", ".archives", `${hash}.txt`));
+    const before = digestVaultTree(vault);
+
+    const report = await scan("--detectors", DETECTOR);
+    const finding = report.findings.find((f) => f.detector === DETECTOR);
+    expect(finding).toBeDefined();
+    expect(JSON.stringify(finding)).toContain(summaryPath);
+    expect(digestVaultTree(vault)).toBe(before);
+  });
+});
+
+/**
+ * The doctor's informational archive section (answer trust, Task C6):
+ * count-only - entry count, total bytes, missing/mismatched counts - always
+ * present in the JSON, a line in the human output only when there is
+ * something to describe, and no fix verb anywhere.
+ */
+describe("the doctor archive section", () => {
+  interface ArchivesJson {
+    readonly archives: {
+      readonly entries: number;
+      readonly totalBytes: number;
+      readonly missing: number;
+      readonly mismatched: number;
+      readonly uncited: number;
+    };
+  }
+  const doctorJson = async (): Promise<ArchivesJson> => {
+    const out = await runCli(["brain", "doctor", "--vault", vault, "--json"], { env: env() });
+    expect(out.returncode).toBe(0);
+    return JSON.parse(out.stdout) as ArchivesJson;
+  };
+
+  const ingestOne = (
+    contents: string,
+    rel = "Articles/counted.md",
+  ): { hash: string; summaryPath: string } => {
+    mkdirSync(join(vault, rel, ".."), { recursive: true });
+    writeFileSync(join(vault, rel), contents, "utf8");
+    const res = ingestCore(
+      vault,
+      {
+        sourcePath: rel,
+        summary: "Counted.",
+        extraction: { entities: [{ category: "concept", name: "Counted" }], relations: [] },
+      },
+      { agent: "test-agent", now: new Date("2026-02-03T00:00:00Z") },
+    );
+    if (res.sourceArchiveHash === undefined) throw new Error("expected an archive stamp");
+    return { hash: res.sourceArchiveHash, summaryPath: res.summaryPath };
+  };
+
+  test("a vault that never archived reports an all-zero section, and prints no line", async () => {
+    expect(await doctorJson()).toMatchObject({
+      archives: { entries: 0, totalBytes: 0, missing: 0, mismatched: 0, uncited: 0 },
+    });
+    const human = await runCli(["brain", "doctor", "--vault", vault], { env: env() });
+    expect(human.returncode).toBe(0);
+    expect(human.stdout).not.toContain("archives:");
+  });
+
+  test("an ingested source is one entry with its bytes, on both surfaces", async () => {
+    ingestOne("counted bytes\n");
+    // Whole-object, not a subset match: a key smuggled into the section
+    // (or an old shape drifting back) fails here.
+    expect((await doctorJson()).archives).toEqual({
+      entries: 1,
+      totalBytes: Buffer.byteLength("counted bytes\n", "utf8"),
+      missing: 0,
+      mismatched: 0,
+      uncited: 0,
+    });
+
+    const human = await runCli(["brain", "doctor", "--vault", vault], { env: env() });
+    expect(human.stdout).toContain(
+      `archives: 1 entries, ${Buffer.byteLength("counted bytes\n", "utf8")} bytes, 0 missing, 0 mismatched, 0 uncited`,
+    );
+  });
+
+  test("a removed entry counts as missing; a tampered one as mismatched", async () => {
+    const { hash } = ingestOne("audited bytes\n");
+    const entry = join(vault, "Brain", ".archives", `${hash}.txt`);
+
+    rmSync(entry);
+    expect((await doctorJson()).archives).toMatchObject({ entries: 0, missing: 1 });
+
+    writeFileSync(entry, "rewritten", "utf8");
+    expect((await doctorJson()).archives).toMatchObject({ entries: 1, mismatched: 1 });
+  });
+
+  test("a page deleted out-of-band leaves its entry counted as uncited", async () => {
+    // Two sources, two distinct entries. Removing the first summary page
+    // out-of-band - the state a re-stamped page or a review-rejected staged
+    // ingest leaves behind - leaves its entry in the store, cited by
+    // nothing, while the second entry keeps its page.
+    const first = ingestOne("orphaned bytes\n", "Articles/orphaned.md");
+    const second = ingestOne("still cited bytes\n", "Articles/cited.md");
+    expect(first.hash).not.toBe(second.hash);
+    rmSync(join(vault, first.summaryPath));
+
+    expect((await doctorJson()).archives).toMatchObject({
+      entries: 2,
+      uncited: 1,
+      missing: 0,
+      mismatched: 0,
+    });
+
+    const human = await runCli(["brain", "doctor", "--vault", vault], { env: env() });
+    expect(human.stdout).toContain(", 1 uncited");
+  });
+
+  test("an unreadable archive store is an uncertain section, not a failed run", async () => {
+    // Platform-neutral refusal: a FILE standing where the store directory
+    // belongs. A chmod cannot deny on Windows.
+    writeFileSync(join(vault, "Brain", ".archives"), "not a directory", "utf8");
+
+    // A completed run, not a throw - and the human surface names the skip.
+    const human = await runCli(["brain", "doctor", "--vault", vault], { env: env() });
+    expect(human.returncode).toBe(0);
+    expect(human.stdout).toContain("[UNSURE] vault-walk-entry-skipped");
+    expect(human.stdout).not.toContain("archives: ");
+
+    // The JSON payload stays parseable, answers the unavailability by name,
+    // and carries the skip in the uncertainty stream.
+    const out = await runCli(["brain", "doctor", "--vault", vault, "--json"], { env: env() });
+    expect(out.returncode).toBe(0);
+    const payload = JSON.parse(out.stdout) as {
+      archives: Record<string, unknown>;
+      uncertain?: ReadonlyArray<{ code: string; path?: string }>;
+    };
+    expect(payload.archives).toEqual({ unavailable: true });
+    expect(payload.uncertain?.some((u) => u.code === "vault-walk-entry-skipped")).toBe(true);
   });
 });
